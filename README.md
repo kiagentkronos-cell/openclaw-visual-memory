@@ -43,6 +43,10 @@ On hosts that gate conversation access for non-bundled plugins, grant it in
 }
 ```
 
+Note: durable next-turn injections require prompt injection to be allowed
+for this plugin; if `plugins.entries.visual-memory.hooks.allowPromptInjection`
+is ever set to `false`, results will silently stop appearing.
+
 After code changes: `openclaw plugins reload visual-memory`.
 
 ## Config (`plugins.entries.visual-memory.config`)
@@ -55,19 +59,24 @@ All keys optional; unknown keys are rejected (`additionalProperties: false`).
 | `workspaceDir` | `~/.openclaw/workspace` | Workspace holding the tool repo. |
 | `vmScriptRelPath` | `scripts/visual-memory/vm.py` | CLI path relative to workspace. |
 | `venvRelPath` | `scripts/visual-memory/venv/bin/python` | Interpreter relative to workspace. |
-| `checkTimeoutMs` | `30000` | Hard per-check timeout; expiry kills the CLI and injects nothing. |
+| `checkTimeoutMs` | `30000` | Hard per-check timeout; expiry kills the CLI and injects the "not available" marker. |
 | `maxImageSizeBytes` | `20971520` | Oversized images are skipped (no spawn). |
 | `maxImageAgeMs` | `900000` | Stale-mtime images are skipped (replay guard). |
 | `injectionTtlMs` | `120000` | TTL of the queued injection; late results expire instead of landing in an unrelated turn. |
+| `stagingRetryMs` | `5000` | Delay before the single staging-pending retry probes `originalMedia` (existence-guarded). |
+| `diagLogPath` | `~/.openclaw/logs/visual-memory-hook.log` | Metadata-only decision log (1 MB cap, newest half kept). |
 
 ## How it works
 
 1. `message_received` (typed `api.on`) inspects `event.media[]` facts
    (`kind === "image"` or `contentType: image/*` with a local `path`).
 2. **Staging pending:** when `mediaStagingPending` is true, `media` is
-   intentionally withheld and `originalMedia` is not locally readable — the
-   handler returns immediately and lets the later staged event for the same
-   `messageId` run the check.
+   intentionally withheld. The host emits `message_received` only once per
+   accepted turn, so waiting for a later staged event never fires. The
+   handler instead schedules **one** guarded retry after `stagingRetryMs`:
+   each `originalMedia.path` is existence-probed; locally readable images
+   (e.g. WhatsApp `media/inbound`) are checked, true remote paths give up
+   quietly after the single attempt.
 3. Checked messages are recorded in a bounded messageId-keyed ledger, so the
    staging→staged pair (or any redelivery) triggers exactly **one** check and
    one injection.
@@ -75,16 +84,27 @@ All keys optional; unknown keys are rejected (`additionalProperties: false`).
    by GPU latency; a per-run `setTimeout` guard SIGKILLs wedged CLI calls.
 5. On completion the result is queued via
    `api.session.workflow.enqueueNextTurnInjection`
-   (`placement: prepend_context`, `idempotencyKey` per message+session):
+   (`placement: prepend_context`, `idempotencyKey` per message+session).
+   **Every processed image message injects exactly one line** (protocol
+   change 2026-09-29 — the agent must distinguish "checked, nothing
+   found" from "not checked"):
 
    ```
    [Visual Memory] Treffer: <Name> (kind, confidence, score)[; …]
    [Visual Memory] keine Treffer
+   [Visual Memory] Check nicht verfügbar (timeout)
+   [Visual Memory] Check nicht verfügbar (fehler: <token>)
    ```
 
-6. **Fail-silent policy:** CLI failure, timeout, crash, or unparseable output
-   inject **nothing** (a failed check must never masquerade as "no hits").
-   Errors land in the plugin log only.
+   "Nicht verfügbar" means the state is UNKNOWN: the agent must not re-run
+   the check manually (that would double GPU work). Messages without images
+   inject nothing at all.
+
+6. **Diagnostics:** every decision (skip, dedupe, check, injection, host
+   refusal) appends one metadata-only line to `diagLogPath` — never message
+   content, image paths, or hit names. A refused enqueue
+   (`{ enqueued: false }`, which the host does NOT signal by throwing) is
+   logged as `inject_failed reason=host_refused`.
 
 ## Boundaries
 

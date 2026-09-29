@@ -23,12 +23,22 @@ export interface VmCheckConfig {
   maxImageAgeMs: number;
   /** TTL for the next-turn injection. */
   injectionTtlMs: number;
+  /** Delay before the single staging-pending retry probes originalMedia. */
+  stagingRetryMs: number;
+  /** Decision-path diagnostic log file (metadata only, size-capped). */
+  diagLogPath: string;
 }
 
 /** Derive the OpenClaw workspace from $HOME so no personal paths are hardcoded. */
 function defaultWorkspaceDir(): string {
   const home = process.env.HOME ?? process.env.USERPROFILE ?? "~";
   return `${home.replace(/\/+$/, "")}/.openclaw/workspace`;
+}
+
+/** Default diagnostic log: OpenClaw state/logs dir under the host user home. */
+function defaultDiagLogPath(): string {
+  const home = process.env.HOME ?? process.env.USERPROFILE ?? "~";
+  return `${home.replace(/\/+$/, "")}/.openclaw/logs/visual-memory-hook.log`;
 }
 
 export const DEFAULT_CONFIG: VmCheckConfig = {
@@ -40,6 +50,8 @@ export const DEFAULT_CONFIG: VmCheckConfig = {
   maxImageSizeBytes: 20 * 1024 * 1024,
   maxImageAgeMs: 15 * 60 * 1000,
   injectionTtlMs: 120_000,
+  stagingRetryMs: 5_000,
+  diagLogPath: defaultDiagLogPath(),
 };
 
 /** Merge raw pluginConfig (possibly undefined/empty) over the defaults. */
@@ -57,5 +69,7 @@ export function normalizeConfig(raw: Record<string, unknown> | undefined): VmChe
     maxImageSizeBytes: pick<number>("maxImageSizeBytes") ?? DEFAULT_CONFIG.maxImageSizeBytes,
     maxImageAgeMs: pick<number>("maxImageAgeMs") ?? DEFAULT_CONFIG.maxImageAgeMs,
     injectionTtlMs: pick<number>("injectionTtlMs") ?? DEFAULT_CONFIG.injectionTtlMs,
+    stagingRetryMs: pick<number>("stagingRetryMs") ?? DEFAULT_CONFIG.stagingRetryMs,
+    diagLogPath: pick<string>("diagLogPath") ?? DEFAULT_CONFIG.diagLogPath,
   };
 }

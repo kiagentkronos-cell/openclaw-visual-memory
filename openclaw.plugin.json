@@ -54,6 +54,17 @@
         "minimum": 5000,
         "default": 120000,
         "description": "Next-turn injection TTL: results that arrive after this window are dropped instead of injected into an unrelated turn."
+      },
+      "stagingRetryMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 60000,
+        "default": 5000,
+        "description": "Delay before the single staging-pending retry probes originalMedia paths (existence-guarded)."
+      },
+      "diagLogPath": {
+        "type": "string",
+        "description": "Decision-path diagnostics log file (metadata only, 1 MB size cap). Defaults to ~/.openclaw/logs/visual-memory-hook.log."
       }
     }
   }

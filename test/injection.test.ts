@@ -27,17 +27,24 @@ test("no hits produce explicit no-match block", () => {
   assert.equal(buildInjectionText(outcome), "[Visual Memory] keine Treffer");
 });
 
-test("vm.py failure (ok=false) yields error outcome and NO injection", () => {
+test("vm.py failure (ok=false) injects explicit unavailable marker, not silence", () => {
   const outcome = parseCheckOutput('{"ok":false,"error":"no face found"}');
   assert.equal(outcome.status, "error");
-  assert.equal(buildInjectionText(outcome), undefined);
+  assert.equal(
+    buildInjectionText(outcome),
+    "[Visual Memory] Check nicht verfügbar (fehler: vm_failure)",
+  );
 });
 
-test("garbage stdout is an error and yields no injection", () => {
+test("garbage stdout is an error and yields the unavailable marker", () => {
   for (const bad of ["", "   ", "not json", "42", '{"ok":true}']) {
     const outcome = parseCheckOutput(bad);
     assert.equal(outcome.status, "error", `input=${JSON.stringify(bad)}`);
-    assert.equal(buildInjectionText(outcome), undefined);
+    assert.equal(
+      buildInjectionText(outcome),
+      "[Visual Memory] Check nicht verfügbar (fehler: bad_output)",
+      `input=${JSON.stringify(bad)}`,
+    );
   }
 });
 
@@ -48,6 +55,19 @@ test("hit rows without a usable name are dropped, rest survives", () => {
   assert.equal(buildInjectionText(outcome), "[Visual Memory] Treffer: Anna (person, certain, 0.80)");
 });
 
-test("timeout/crash mapping: caller error outcome injects nothing", () => {
-  assert.equal(buildInjectionText({ status: "error", reason: "timeout" }), undefined);
+test("timeout injects the timeout token (agent must NOT re-check manually)", () => {
+  assert.equal(
+    buildInjectionText({ status: "error", reason: "check timed out after 30000ms" }),
+    "[Visual Memory] Check nicht verfügbar (timeout)",
+  );
+});
+
+test("reason tokens are sanitized (no paths or free text leak into the block)", () => {
+  const text = buildInjectionText({
+    status: "error",
+    reason: "image not readable: /home/user/.openclaw/media/inbound/secret.jpg",
+  });
+  assert.ok(!text.includes("/home/"), "no filesystem paths in injection");
+  assert.ok(!text.includes("secret"), "no raw reason text in injection");
+  assert.match(text, /fehler: file_not_readable/);
 });

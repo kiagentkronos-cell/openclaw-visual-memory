@@ -5,6 +5,16 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { handleMessageReceived, MessageLedger, type HandlerDeps } from "../src/handler.ts";
 import type { SpawnFn } from "../src/checker.ts";
+import type { DiagRecord } from "../src/diaglog.ts";
+
+/** Capture sink for the decision-path diagnostics. */
+export function captureDiag(): { records: DiagRecord[]; sink: import("../src/diaglog.ts").DiagSink } {
+  const records: DiagRecord[] = [];
+  return {
+    records,
+    sink: { record: (r) => records.push(r) },
+  };
+}
 
 async function fakeImage(): Promise<string> {
   const dir = await mkdtemp(path.join(tmpdir(), "vmhook-h-"));
@@ -41,8 +51,15 @@ function fakeSpawn(opts: { stdout: string; code?: number; delayMs?: number }): {
 
 const makeDeps = (
   overrides: Partial<HandlerDeps> & { spawn: SpawnFn },
-): { deps: HandlerDeps; enqueued: Array<{ sessionKey: string; text: string; idempotencyKey: string }> } => {
+): {
+  deps: HandlerDeps;
+  enqueued: Array<{ sessionKey: string; text: string; idempotencyKey: string }>;
+  diag: DiagRecord[];
+  scheduled: Array<() => void>;
+} => {
   const enqueued: Array<{ sessionKey: string; text: string; idempotencyKey: string }> = [];
+  const diagCap = captureDiag();
+  const scheduled: Array<() => void> = [];
   const deps: HandlerDeps = {
     config: {
       enabled: true,
@@ -53,17 +70,25 @@ const makeDeps = (
       maxImageSizeBytes: 0,
       maxImageAgeMs: 0,
       injectionTtlMs: 60000,
+      stagingRetryMs: 5000,
+      diagLogPath: "/tmp/vm-hook-test-diag.log",
     },
     pythonPath: "/fake/python",
     scriptPath: "/fake/vm.py",
     log: { info() {}, warn() {}, error() {} },
     processed: new MessageLedger(),
+    diag: diagCap.sink,
+    schedule: (fn) => {
+      scheduled.push(fn);
+      return null;
+    },
+    fileExists: () => false,
     enqueue: async (p) => {
       enqueued.push(p);
     },
     ...overrides,
   };
-  return { deps, enqueued };
+  return { deps, enqueued, diag: diagCap.records, scheduled };
 };
 
 test("no media → no CLI call, no injection", async () => {
@@ -121,7 +146,7 @@ test("empty hits → explicit no-match injection", async () => {
   assert.equal(enqueued[0]!.text, "[Visual Memory] keine Treffer");
 });
 
-test("CLI failure → nothing injected", async () => {
+test("CLI failure → explicit unavailable injection (never silence)", async () => {
   const image = await fakeImage();
   const { spawn } = fakeSpawn({ stdout: "boom", code: 1 });
   const { deps, enqueued } = makeDeps({ spawn });
@@ -131,35 +156,99 @@ test("CLI failure → nothing injected", async () => {
     deps,
   );
   if (decision.action === "queued") await decision.check;
-  assert.equal(enqueued.length, 0);
+  assert.equal(enqueued.length, 1);
+  assert.equal(enqueued[0]!.text, "[Visual Memory] Check nicht verfügbar (fehler: exit_code)");
 });
 
-test("staging-pending without media → skip now, later staged event checks", async () => {
+test("staging-pending without media → skip now, retry probes originals, later staged event dedupes", async () => {
   const image = await fakeImage();
   const { spawn, calls } = fakeSpawn({ stdout: '{"ok":true,"hits":[]}' });
-  const { deps, enqueued } = makeDeps({ spawn });
-  // First event: staging pending, only originalMedia (NOT locally readable).
+  const { deps, enqueued, scheduled } = makeDeps({ spawn, fileExists: () => true });
+  // First event: staging pending, only originalMedia (docs: NOT locally readable).
   const d1 = handleMessageReceived(
     {
       messageId: "m-stage",
       mediaStagingPending: true,
-      originalMedia: [{ kind: "image", url: "https://wa.example/x.jpg" }],
+      originalMedia: [{ kind: "image", path: image }],
     },
     { sessionKey: "s1" },
     deps,
   );
   assert.equal(d1.action, "staging-pending");
   assert.equal(calls.calls, 0);
-  // Later staged event for the SAME messageId → check runs once.
+  assert.equal(scheduled.length, 1, "exactly one retry scheduled");
+  // Run the scheduled retry: the existence probe passes (fake true) → check.
+  scheduled[0]!();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(calls.calls, 1);
+  assert.equal(enqueued.length, 1);
+  // A real staged event afterwards → deduped against the retry's claim.
   const d2 = handleMessageReceived(
     { messageId: "m-stage", media: [{ kind: "image", path: image }] },
     { sessionKey: "s1" },
     deps,
   );
-  assert.equal(d2.action, "queued");
-  if (d2.action === "queued") await d2.check;
+  assert.equal(d2.action, "duplicate");
   assert.equal(calls.calls, 1);
   assert.equal(enqueued.length, 1);
+});
+
+test("staging-pending with unreadable originals → exactly one retry, then quiet", async () => {
+  const { spawn, calls } = fakeSpawn({ stdout: '{"ok":true,"hits":[]}' });
+  const logs: string[] = [];
+  const { deps, scheduled, diag } = makeDeps({
+    spawn,
+    fileExists: () => false,
+    log: { info() {}, warn() {}, error: (m) => logs.push(m) },
+  });
+  const d1 = handleMessageReceived(
+    {
+      messageId: "m-remote",
+      mediaStagingPending: true,
+      originalMedia: [{ kind: "image", url: "https://wa.example/x.jpg", path: "\\\\nas\\share\\x.jpg" }],
+    },
+    { sessionKey: "s1" },
+    deps,
+  );
+  assert.equal(d1.action, "staging-pending");
+  assert.equal(scheduled.length, 1);
+  scheduled[0]!();
+  await new Promise((r) => setTimeout(r, 5));
+  // Never readable → no check ever, no error-log flood, one quiet skip line.
+  assert.equal(calls.calls, 0);
+  assert.equal(logs.length, 0);
+  const skipLines = diag.filter((r) => r.decision === "staging_pending_skip");
+  assert.equal(skipLines.length, 2, "initial skip + one retry give-up");
+  assert.equal(skipLines[1]?.reason, "retry_not_readable");
+  // No further scheduling happened.
+  assert.equal(scheduled.length, 1);
+});
+
+test("staging retry dedupes when a real staged event claimed first", async () => {
+  const image = await fakeImage();
+  const { spawn, calls } = fakeSpawn({ stdout: '{"ok":true,"hits":[]}' });
+  const { deps, scheduled, diag } = makeDeps({ spawn, fileExists: () => true });
+  handleMessageReceived(
+    {
+      messageId: "m-race",
+      mediaStagingPending: true,
+      originalMedia: [{ kind: "image", path: image }],
+    },
+    { sessionKey: "s1" },
+    deps,
+  );
+  // Hypothetical real staged event arrives BEFORE the retry fires.
+  const d2 = handleMessageReceived(
+    { messageId: "m-race", media: [{ kind: "image", path: image }] },
+    { sessionKey: "s1" },
+    deps,
+  );
+  assert.equal(d2.action, "queued");
+  if (d2.action === "queued") await d2.check;
+  scheduled[0]!();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(calls.calls, 1, "retry must not double-check");
+  assert.ok(diag.some((r) => r.decision === "dedup_skip"));
 });
 
 test("duplicate messageId → checked exactly once", async () => {
@@ -188,6 +277,8 @@ test("disabled config → nothing happens", async () => {
       maxImageSizeBytes: 0,
       maxImageAgeMs: 0,
       injectionTtlMs: 60000,
+      stagingRetryMs: 5000,
+      diagLogPath: "/tmp/vm-hook-test-diag.log",
     },
   });
   const decision = handleMessageReceived(
@@ -278,6 +369,76 @@ test("enqueue failure is logged, never thrown", async () => {
   assert.equal(decision.action, "queued");
   if (decision.action === "queued") await decision.check; // must not throw
   assert.ok(logs.some((l) => l.includes("enqueue failed")));
+});
+
+test("host refusal (enqueued:false) surfaces as inject_failed, not injected", async () => {
+  const image = await fakeImage();
+  const { spawn } = fakeSpawn({ stdout: '{"ok":true,"hits":[]}' });
+  const logs: string[] = [];
+  const { deps, diag } = makeDeps({
+    spawn,
+    enqueue: async () => ({ enqueued: false }),
+    log: { info() {}, warn() {}, error: (m) => logs.push(m) },
+  });
+  const decision = handleMessageReceived(
+    { messageId: "m-refuse", media: [{ kind: "image", path: image }] },
+    { sessionKey: "s1" },
+    deps,
+  );
+  if (decision.action === "queued") await decision.check;
+  const inject = diag.filter((r) => r.decision === "injected" || r.decision === "inject_failed");
+  assert.equal(inject.length, 1);
+  assert.equal(inject[0]!.decision, "inject_failed");
+  assert.equal(inject[0]!.reason, "host_refused");
+  assert.ok(logs.some((l) => l.includes("enqueue refused")));
+});
+
+test("decision path logs exactly one line per decision, metadata-only (no PII)", async () => {
+  const image = await fakeImage();
+  const { spawn } = fakeSpawn({
+    stdout: '{"ok":true,"hits":[{"name":"Alice","kind":"person","score":0.9,"confidence":"certain"}]}',
+  });
+  const { deps, diag } = makeDeps({ spawn });
+  handleMessageReceived(
+    {
+      messageId: "m-pii",
+      content: "Geheimer Nachrichtentext mit privaten Details",
+      media: [{ kind: "image", path: image }],
+      metadata: { provider: "whatsapp" },
+    },
+    { sessionKey: "s1" },
+    deps,
+  );
+  await new Promise((r) => setTimeout(r, 10));
+  const decisions = diag.map((r) => r.decision);
+  // One greppable trail for a successful image message.
+  assert.deepEqual(decisions, ["image_found", "check_started", "check_hits", "injected"]);
+  // No record may carry message content, paths, or hit names.
+  const serialized = JSON.stringify(diag);
+  assert.ok(!serialized.includes("Geheimer"));
+  assert.ok(!serialized.includes(image), "image path must never be logged");
+  assert.ok(!serialized.includes("Alice"), "hit names must never be logged");
+  assert.equal(diag[0]!.channel, "whatsapp");
+  assert.equal(diag[0]!.msgId, "m-pii");
+});
+
+test("failure path: check_error lands in the diag trail, unavailable marker injected", async () => {
+  const image = await fakeImage();
+  const { spawn } = fakeSpawn({ stdout: "boom", code: 3 });
+  const { deps, diag, enqueued } = makeDeps({ spawn });
+  const decision = handleMessageReceived(
+    { messageId: "m-err", media: [{ kind: "image", path: image }] },
+    { sessionKey: "s1" },
+    deps,
+  );
+  if (decision.action === "queued") await decision.check;
+  const err = diag.find((r) => r.decision === "check_error");
+  assert.ok(err, "check_error recorded");
+  assert.equal(err.reason, "exit_code");
+  // Protocol: the agent is told the state is UNKNOWN (marker, hits=0).
+  assert.equal(enqueued.length, 1);
+  assert.match(enqueued[0]!.text, /Check nicht verfügbar \(fehler: exit_code\)/);
+  assert.equal(diag.find((r) => r.decision === "injected")?.hits, 0);
 });
 
 test("MessageLedger bounds memory", () => {

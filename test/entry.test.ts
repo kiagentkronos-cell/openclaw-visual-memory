@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { registerMessageHook, type ApiLike } from "../src/entry.ts";
 import type { SpawnFn } from "../src/checker.ts";
+import { NULL_DIAG_SINK, type DiagRecord } from "../src/diaglog.ts";
 
 function fakeApi(pluginConfig?: Record<string, unknown>): {
   api: ApiLike;
@@ -81,7 +82,7 @@ test("image event flows to injection with placement prepend_context", async () =
   const file = await image();
   const { api, injected } = fakeApi({ workspaceDir: "/ws" });
   const { spawn } = okSpawn('{"ok":true,"hits":[{"name":"Anna","kind":"person","score":0.9,"confidence":"certain"}]}');
-  const { handle } = registerMessageHook(api, { spawn });
+  const { handle } = registerMessageHook(api, { spawn, diag: NULL_DIAG_SINK });
   handle(
     { messageId: "e1", media: [{ kind: "image", path: file }] },
     { sessionKey: "agent:main:whatsapp:direct:+49xxxxxxx" },
@@ -100,4 +101,33 @@ test("config from pluginConfig overrides defaults", () => {
   const { config } = registerMessageHook(api);
   assert.equal(config.checkTimeoutMs, 45000);
   assert.equal(config.enabled, false);
+});
+
+test("staging-pending event schedules exactly one guarded retry via wiring", async () => {
+  const { api } = fakeApi({ workspaceDir: "/ws", stagingRetryMs: 7000 });
+  const scheduled: Array<{ fn: () => void; delayMs: number }> = [];
+  const records: DiagRecord[] = [];
+  const { handle } = registerMessageHook(api, {
+    diag: { record: (r) => records.push(r) },
+    schedule: (fn, delayMs) => {
+      scheduled.push({ fn, delayMs });
+      return null;
+    },
+    fileExists: () => false,
+  });
+  handle(
+    {
+      messageId: "w1",
+      mediaStagingPending: true,
+      originalMedia: [{ kind: "image", url: "https://x/y.jpg" }],
+    },
+    { sessionKey: "agent:main:whatsapp:direct:+49xxxxxxx" },
+  );
+  assert.equal(scheduled.length, 1);
+  assert.equal(scheduled[0]!.delayMs, 7000, "retry delay from config");
+  // Fire the retry with unreadable originals → quiet give-up, no crash.
+  scheduled[0]!.fn();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.ok(records.some((r) => r.decision === "staging_pending_skip"));
+  assert.ok(records.some((r) => r.reason === "retry_not_readable"));
 });

@@ -2,15 +2,19 @@
  * Injection block builder.
  *
  * Turns vm.py `check` results into the compact context block that is queued
- * for the next agent turn. Format (fixed contract, tested):
+ * for the next agent turn. Three modes (fixed contract, tested; operator
+ * protocol change 2026-09-29 — every processed image message reports its
+ * outcome so the agent can tell "checked, nothing found" from "not checked"):
  *
  *   [Visual Memory] Treffer: Alice (person, certain, 0.94); Bello (animal, possible, 0.87)
- *   [Visual Memory] keine Treffer
+ *   [Visual Memory] keine Treffer                       (check ran, zero hits)
+ *   [Visual Memory] Check nicht verf\u00fcgbar (timeout)             (status unknown — do NOT re-check manually)
+ *   [Visual Memory] Check nicht verf\u00fcgbar (fehler: exit_code)
  *
- * Failure policy: when the CLI call failed (ok=false, timeout, crash, invalid
- * JSON) the plugin injects NOTHING — a failed check must never look like a
- * "no hits" result (rule: never invent). This module therefore returns
- * undefined for failures; the caller logs.
+ * The token in parentheses is machine-readable (timeout | fehler: <reason>);
+ * the agent must treat "nicht verf\u00fcgbar" as UNKNOWN state and must not
+ * re-run the check itself (that would double GPU work). Messages WITHOUT
+ * images still inject nothing at all.
  */
 
 export interface VmHit {
@@ -55,8 +59,12 @@ export function parseCheckOutput(stdout: string): VmCheckOutcome {
     return { status: "error", reason: "non-object output" };
   }
   const obj = parsed as Record<string, unknown>;
-  if (obj.ok !== true || !Array.isArray(obj.hits)) {
+  if (obj.ok !== true) {
     return { status: "error", reason: "vm.py reported failure" };
+  }
+  if (!Array.isArray(obj.hits)) {
+    // ok=true without a hits array is a contract violation, not a vm failure.
+    return { status: "error", reason: "invalid JSON output" };
   }
   const hits: VmHit[] = [];
   for (const raw of obj.hits) {
@@ -80,15 +88,49 @@ export function parseCheckOutput(stdout: string): VmCheckOutcome {
 
 /**
  * Build the next-turn injection text from a check outcome.
- * Returns undefined when nothing must be injected (error case).
+ * Every image message gets exactly one line — hits, "keine Treffer", or the
+ * explicit "Check nicht verf\u00fcgbar" marker. Undefined only when there is
+ * nothing to report at all (no image was processed); the caller never
+ * receives undefined for a processed image message.
  */
-export function buildInjectionText(outcome: VmCheckOutcome): string | undefined {
-  if (outcome.status !== "ok") {
-    return undefined;
+export function buildInjectionText(outcome: VmCheckOutcome): string {
+  if (outcome.status === "error") {
+    return `${INJECTION_PREFIX} ${unavailableText(outcome.reason)}`;
   }
   if (outcome.hits.length === 0) {
     return `${INJECTION_PREFIX} keine Treffer`;
   }
   const formatted = outcome.hits.map(formatHit).join("; ");
   return `${INJECTION_PREFIX} Treffer: ${formatted}`;
+}
+
+/**
+ * Internal marker for "status unknown — do not re-check manually".
+ * `timeout` stays a bare token; every other failure is `fehler: <token>`.
+ * The reason token is machine-readable and PII-free (see checker reasons).
+ */
+export function unavailableText(reason: string): string {
+  const lowered = reason.toLowerCase();
+  if (lowered.includes("timed out") || lowered.includes("timeout")) {
+    return "Check nicht verf\u00fcgbar (timeout)";
+  }
+  return `Check nicht verf\u00fcgbar (fehler: ${sanitizeReasonToken(reason)})`;
+}
+
+/** Compact greppable token from a checker reason string. */
+function sanitizeReasonToken(reason: string): string {
+  const r = reason.toLowerCase();
+  if (r.includes("not readable")) return "file_not_readable";
+  if (r.includes("size guard")) return "too_large";
+  if (r.includes("age guard")) return "too_old";
+  if (r.includes("spawn error") || r.includes("spawn failed") || r.includes("bad interpreter")) {
+    return "spawn_error";
+  }
+  if (r.includes("exited")) return "exit_code";
+  if (r.includes("json") || r.includes("empty output") || r.includes("non-object")) {
+    return "bad_output";
+  }
+  if (r.includes("reported failure")) return "vm_failure";
+  // Fall back to a short sanitized prefix; never raw free text.
+  return reason.toLowerCase().replace(/[^a-z0-9_]+/g, "_").slice(0, 24) || "error";
 }
