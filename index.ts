@@ -1,10 +1,22 @@
 /**
  * openclaw-visual-memory — plugin entry.
  *
- * Hook: message_received (typed api.on).
+ * Hooks: message_received (typed api.on) AND before_prompt_build.
  *
- * Flow (docs/plugins/hooks.md + hooks/messages.md):
- * 1. Inbound message with typed media[] facts is observed.
+ * Why two seams (root cause, 2026-09-29): the WhatsApp channel plugin does
+ * NOT broadcast message_received to plugins unless the operator opts in via
+ * channels.whatsapp.pluginHooks.messageReceived (docs/channels/whatsapp.md,
+ * "Plugin hooks and privacy"). Webchat fires it; WhatsApp never did — the
+ * handler was correct but unreachable there. before_prompt_build is the
+ * channel-agnostic agent-turn hook that fires for every admitted turn on
+ * every channel; inbound images appear there as `[media attached: ...]`
+ * prompt notes (src/promptmedia.ts decodes them, including the host's
+ * media://inbound alias). Image-path claims in the ledger make the seams
+ * idempotent against each other, so one image is checked exactly once.
+ *
+ * Flow (docs/plugins/hooks.md + hooks/messages.md + prompt-and-session.md):
+ * 1. Inbound message with typed media[] facts is observed (message_received),
+ *    or its image paths appear as prompt notes (before_prompt_build).
  * 2. Locally readable image facts trigger the Visual Memory CLI
  *    (`vm.py check <image>`) in the tool repository — the plugin holds no
  *    register logic of its own.

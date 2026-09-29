@@ -71,6 +71,7 @@ const makeDeps = (
       maxImageAgeMs: 0,
       injectionTtlMs: 60000,
       stagingRetryMs: 5000,
+      mediaDir: "/ws/media",
       diagLogPath: "/tmp/vm-hook-test-diag.log",
     },
     pythonPath: "/fake/python",
@@ -278,6 +279,7 @@ test("disabled config → nothing happens", async () => {
       maxImageAgeMs: 0,
       injectionTtlMs: 60000,
       stagingRetryMs: 5000,
+      mediaDir: "/ws/media",
       diagLogPath: "/tmp/vm-hook-test-diag.log",
     },
   });

@@ -23,9 +23,23 @@
  * - Every decision appends exactly one PII-free line to the diagnostic sink
  *   (see diaglog.ts) so silent failures (host-side enqueue refusals,
  *   missing events) are greppable after the fact.
+ *
+ * Second seam (WhatsApp root cause, 2026-09-29): the WhatsApp channel plugin
+ * does NOT emit `message_received` for plugin hooks unless the operator
+ * opts in via channels.whatsapp.pluginHooks.messageReceived (docs/channels/
+ * whatsapp.md "Plugin hooks and privacy"; monitor: suppressMessageReceived
+ * Hooks = true by default). Webchat proved the handler itself works; on
+ * WhatsApp it was never invoked. The fix adds handlePromptBuild on
+ * `before_prompt_build`, the channel-agnostic agent-turn hook that fires
+ * for EVERY admitted turn. Inbound image paths arrive there as
+ * `[media attached: ...]` prompt notes (src/promptmedia.ts). Because
+ * history re-projects old notes into later prompts, the check claims each
+ * IMAGE PATH in the ledger — a path seen once is never re-checked,
+ * whichever seam saw it first.
  */
 
 import { localImagePaths, type MediaFactLike } from "./media.ts";
+import { promptImageFacts } from "./promptmedia.ts";
 import { buildInjectionText, type VmCheckOutcome, type VmHit } from "./injection.ts";
 import { checkImage, type CheckResult, type SpawnFn } from "./checker.ts";
 import type { VmCheckConfig } from "./config.ts";
@@ -44,6 +58,21 @@ export interface ReceivedEventLike {
 export interface ReceivedContextLike {
   sessionKey?: string;
   messageId?: string;
+}
+
+/** before_prompt_build event shape (docs/plugins/hooks/prompt-and-session). */
+export interface PromptBuildEventLike {
+  prompt?: string;
+  currentUserMessage?: string;
+  messages?: unknown[];
+}
+
+/** before_prompt_build context: agent hook ctx carries channel + trigger. */
+export interface PromptBuildContextLike {
+  sessionKey?: string;
+  channel?: string;
+  channelId?: string;
+  trigger?: string;
 }
 
 /** Session key resolution: event first, then context (docs: both may carry it). */
@@ -112,9 +141,16 @@ export interface HandlerDeps {
   schedule: (fn: () => void, delayMs: number) => unknown;
   /** Existence probe for staged-original guard (fs.existsSync in production). */
   fileExists: (p: string) => boolean;
+  /** Media store root for media://inbound prompt-note aliases. */
+  mediaDir?: string;
 }
 
-/** Short-lived ledger of message keys already handled (bounded). */
+/**
+ * Short-lived ledger of message keys AND image paths already handled
+ * (bounded). Path claims make the two seams (message_received /
+ * before_prompt_build) idempotent against each other and stop prompt-note
+ * re-projection from retriggering checks on old attachments.
+ */
 export class MessageLedger {
   private readonly seen = new Map<string, number>();
   private readonly maxEntries: number;
@@ -140,8 +176,17 @@ export class MessageLedger {
     return true;
   }
 
+  /** Claim an absolute image path (path-keyed namespace `path:`). */
+  claimPath(imagePath: string): boolean {
+    return this.claim(`path:${imagePath}`);
+  }
+
   has(key: string): boolean {
     return this.seen.has(key);
+  }
+
+  hasPath(imagePath: string): boolean {
+    return this.seen.has(`path:${imagePath}`);
   }
 }
 
@@ -205,6 +250,8 @@ export function handleMessageReceived(
     log("dedup_skip");
     return { action: "duplicate" };
   }
+  // Claim the paths too: the prompt-build seam must not re-check them.
+  for (const image of images) deps.processed.claimPath(image);
   log("image_found", { images: images.length });
 
   const sessionKey = resolveSessionKey(event, ctx);
@@ -217,6 +264,80 @@ export function handleMessageReceived(
 
   log("check_started", { images: images.length });
   const check = runCheckAndInject(images, sessionKey, key, msgId, channel, deps);
+  return { action: "queued", check };
+}
+
+/**
+ * Handle one before_prompt_build event (the channel-agnostic seam that also
+ * fires on WhatsApp, where message_received is privacy-suppressed by the
+ * channel plugin). Images arrive there as `[media attached: ...]` notes in
+ * the prompt. Decisions:
+ * - always ONE `prompt_fire` diag line (fire+decision, even when no image —
+ *   greppable trigger evidence on every channel),
+ * - only user-trigger runs get checked (when the host provides the field):
+ *   cron/heartbeat turns carry re-projected history notes, not fresh
+ *   attachments,
+ * - every candidate path is claimed in the ledger first; a path the
+ *   message_received seam already checked (or a re-projected old note)
+ *   dedupes to a duplicate decision, never a second vm.py run.
+ * Never throws.
+ */
+export function handlePromptBuild(
+  event: PromptBuildEventLike,
+  ctx: PromptBuildContextLike,
+  deps: HandlerDeps,
+): HandlerDecision {
+  const channel = ctx.channel ?? ctx.channelId;
+  const msgId = "promptbuild";
+  const log = (decision: DiagKind, extra?: { reason?: string; images?: number }) =>
+    deps.diag.record({ msgId, channel, decision, ...extra });
+
+  if (!deps.config.enabled) {
+    log("disabled");
+    return { action: "disabled" };
+  }
+
+  // Fire+decision on EVERY prompt hook invocation, image or not.
+  log("prompt_fire", ctx.trigger ? { reason: `trigger_${ctx.trigger}` } : undefined);
+
+  // Non-user triggers never introduce fresh inbound attachments; their
+  // prompt may still contain old media notes from history projection.
+  if (ctx.trigger !== undefined && ctx.trigger !== "user") {
+    return { action: "no-image" };
+  }
+
+  const promptText =
+    typeof event.currentUserMessage === "string" && event.currentUserMessage.length > 0
+      ? event.currentUserMessage
+      : event.prompt ?? "";
+  const facts = promptImageFacts(promptText, deps.mediaDir ?? deps.config.mediaDir);
+  const images = facts
+    .map((fact) => fact.path)
+    .filter((p): p is string => typeof p === "string" && p.length > 0);
+  if (images.length === 0) {
+    return { action: "no-image" };
+  }
+
+  const sessionKey = ctx.sessionKey;
+  if (!sessionKey) {
+    deps.log.warn("visual-memory: prompt image without resolvable sessionKey; skipped");
+    log("no_image", { reason: "no_session", images: images.length });
+    return { action: "no-image", reason: "no_session" };
+  }
+
+  // Claim paths; keep only the ones this invocation newly claimed.
+  const fresh = images.filter((p) => deps.processed.claimPath(p));
+  if (fresh.length === 0) {
+    log("dedup_skip", { images: images.length });
+    return { action: "duplicate" };
+  }
+
+  // Idempotency key from the newly-claimed paths: stable per image set even
+  // if the prompt note reappears later.
+  const key = `path:${fresh.join(",")}`;
+  log("image_found", { images: fresh.length });
+  log("check_started", { images: fresh.length });
+  const check = runCheckAndInject(fresh, sessionKey, key, msgId, channel, deps);
   return { action: "queued", check };
 }
 

@@ -62,6 +62,10 @@
         "default": 5000,
         "description": "Delay before the single staging-pending retry probes originalMedia paths (existence-guarded)."
       },
+      "mediaDir": {
+        "type": "string",
+        "description": "OpenClaw media store root; media://inbound prompt-note aliases resolve under <mediaDir>/inbound. Defaults to ~/.openclaw/media."
+      },
       "diagLogPath": {
         "type": "string",
         "description": "Decision-path diagnostics log file (metadata only, 1 MB size cap). Defaults to ~/.openclaw/logs/visual-memory-hook.log."

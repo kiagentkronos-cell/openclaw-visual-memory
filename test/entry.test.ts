@@ -61,10 +61,10 @@ async function image(): Promise<string> {
   return file;
 }
 
-test("registration wires the message_received hook", () => {
+test("registration wires message_received and before_prompt_build", () => {
   const { api, registered } = fakeApi({ workspaceDir: "/ws" });
   registerMessageHook(api);
-  assert.deepEqual(registered, ["message_received"]);
+  assert.deepEqual(registered, ["message_received", "before_prompt_build"]);
 });
 
 test("config defaults resolve under the host user home", () => {

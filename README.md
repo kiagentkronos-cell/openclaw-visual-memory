@@ -26,7 +26,13 @@ openclaw plugins install --link /path/to/openclaw-visual-memory --force
 openclaw plugins enable visual-memory
 ```
 
-The plugin registers `message_received`, a conversation-visible message hook.
+The plugin registers two hooks: `message_received` (typed inbound messages)
+and `before_prompt_build` (channel-agnostic agent turns). The second seam
+exists because the WhatsApp channel plugin privacy-suppresses
+`message_received` unless the operator opts in via
+`channels.whatsapp.pluginHooks.messageReceived` (see docs/channels/whatsapp.md,
+"Plugin hooks and privacy") — on WhatsApp the prompt-build seam sees every
+inbound image as a `[media attached: ...]` prompt note instead.
 On hosts that gate conversation access for non-bundled plugins, grant it in
 `openclaw.json` (merge, don't replace):
 
@@ -64,12 +70,22 @@ All keys optional; unknown keys are rejected (`additionalProperties: false`).
 | `maxImageAgeMs` | `900000` | Stale-mtime images are skipped (replay guard). |
 | `injectionTtlMs` | `120000` | TTL of the queued injection; late results expire instead of landing in an unrelated turn. |
 | `stagingRetryMs` | `5000` | Delay before the single staging-pending retry probes `originalMedia` (existence-guarded). |
+| `mediaDir` | `~/.openclaw/media` | Media store root; `media://inbound/...` prompt-note aliases resolve under `<mediaDir>/inbound`. |
 | `diagLogPath` | `~/.openclaw/logs/visual-memory-hook.log` | Metadata-only decision log (1 MB cap, newest half kept). |
 
 ## How it works
 
 1. `message_received` (typed `api.on`) inspects `event.media[]` facts
    (`kind === "image"` or `contentType: image/*` with a local `path`).
+   `before_prompt_build` (typed `api.on`) fires for every admitted agent
+   turn on every channel; `src/promptmedia.ts` decodes the
+   `[media attached: <path|media://inbound/…> (<mime>)]` notes the host
+   prepends to the prompt back into the same media-fact shape. Only
+   `trigger === "user"` runs are considered. Each candidate image PATH is
+   claimed in the ledger before checking, so a path already handled by
+   `message_received` (webchat) or re-projected from history is never
+   re-checked; every prompt-hook fire logs one `prompt_fire` line (fire +
+   decision, image or not).
 2. **Staging pending:** when `mediaStagingPending` is true, `media` is
    intentionally withheld. The host emits `message_received` only once per
    accepted turn, so waiting for a later staged event never fires. The
@@ -132,7 +148,7 @@ proof is:
 and, after installation against a Gateway:
 
 ```bash
-openclaw plugins inspect visual-memory --runtime --json   # typedHooks: message_received
+openclaw plugins inspect visual-memory --runtime --json   # typedHooks: message_received + before_prompt_build
 ```
 
 ## Tests

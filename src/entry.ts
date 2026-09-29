@@ -8,7 +8,12 @@
 import path from "node:path";
 import { existsSync } from "node:fs";
 import { normalizeConfig, type VmCheckConfig } from "./config.ts";
-import { handleMessageReceived, MessageLedger, type HandlerDeps } from "./handler.ts";
+import {
+  handleMessageReceived,
+  handlePromptBuild,
+  MessageLedger,
+  type HandlerDeps,
+} from "./handler.ts";
 import type { SpawnFn } from "./checker.ts";
 import { FileDiagSink, NULL_DIAG_SINK, type DiagSink } from "./diaglog.ts";
 
@@ -32,7 +37,7 @@ export interface ApiLike {
     };
   };
   on: (
-    hook: "message_received",
+    hook: "message_received" | "before_prompt_build",
     handler: (event: any, ctx: any) => Promise<void> | void,
   ) => void;
 }
@@ -70,6 +75,7 @@ export function buildDeps(api: ApiLike, config: VmCheckConfig, extras: EntryDeps
       new FileDiagSink(config.diagLogPath, 1_048_576, extras.now ?? Date.now),
     schedule: extras.schedule ?? ((fn, delayMs) => setTimeout(fn, delayMs)),
     fileExists: extras.fileExists ?? ((p) => existsSync(p)),
+    mediaDir: config.mediaDir,
     // Return the host result so the handler can see enqueued:false refusals
     // (the host does not throw when it drops an injection).
     enqueue: async ({ sessionKey, text, idempotencyKey, ttlMs }) =>
@@ -84,12 +90,21 @@ export function buildDeps(api: ApiLike, config: VmCheckConfig, extras: EntryDeps
 }
 
 /**
- * Register the message_received hook on a plugin api.
- * Returns a handler function bound to deps for test observability.
+ * Register the hooks on a plugin api:
+ * - message_received: the typed inbound-message seam (webchat and channels
+ *   that broadcast it), and
+ * - before_prompt_build: the channel-agnostic agent-turn seam. The WhatsApp
+ *   channel plugin privacy-suppresses message_received unless the operator
+ *   opts in (channels.whatsapp.pluginHooks.messageReceived), so prompt
+ *   notes are the reliable path there (docs/channels/whatsapp.md). Path
+ *   claiming in the ledger keeps the two seams from double-checking one
+ *   image.
+ * Returns bound handlers for test observability.
  */
 export function registerMessageHook(api: ApiLike, extras: EntryDeps = {}): {
   config: VmCheckConfig;
   handle: (event: unknown, ctx: unknown) => void;
+  handlePrompt: (event: unknown, ctx: unknown) => void;
 } {
   const config = normalizeConfig(api.pluginConfig);
   const deps = buildDeps(api, config, extras);
@@ -109,7 +124,24 @@ export function registerMessageHook(api: ApiLike, extras: EntryDeps = {}): {
   api.on("message_received", async (event, ctx) => {
     handle(event, ctx);
   });
-  return { config, handle };
+  const handlePrompt = (event: unknown, ctx: unknown) => {
+    const decision = handlePromptBuild(
+      event as Parameters<typeof handlePromptBuild>[0],
+      ctx as Parameters<typeof handlePromptBuild>[1],
+      deps,
+    );
+    if (decision.action === "queued") {
+      void decision.check.catch((err: unknown) => {
+        api.logger.error?.(`visual-memory: detached prompt check crashed (${String(err)})`);
+      });
+    }
+  };
+  api.on("before_prompt_build", async (event, ctx) => {
+    // Non-mutating: returning undefined leaves the prompt untouched; the
+    // check itself stays detached (result goes to next-turn injection).
+    handlePrompt(event, ctx);
+  });
+  return { config, handle, handlePrompt };
 }
 
 // Referenced so test overrides can disable the file sink explicitly.

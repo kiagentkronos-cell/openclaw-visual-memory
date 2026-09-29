@@ -25,6 +25,8 @@ export interface VmCheckConfig {
   injectionTtlMs: number;
   /** Delay before the single staging-pending retry probes originalMedia. */
   stagingRetryMs: number;
+  /** Managed media store root (media://inbound aliases resolve here). */
+  mediaDir: string;
   /** Decision-path diagnostic log file (metadata only, size-capped). */
   diagLogPath: string;
 }
@@ -41,6 +43,12 @@ function defaultDiagLogPath(): string {
   return `${home.replace(/\/+$/, "")}/.openclaw/logs/visual-memory-hook.log`;
 }
 
+/** Default media store: OpenClaw state dir under the host user home. */
+function defaultMediaDir(): string {
+  const home = process.env.HOME ?? process.env.USERPROFILE ?? "~";
+  return `${home.replace(/\/+$/, "")}/.openclaw/media`;
+}
+
 export const DEFAULT_CONFIG: VmCheckConfig = {
   enabled: true,
   workspaceDir: defaultWorkspaceDir(),
@@ -51,6 +59,7 @@ export const DEFAULT_CONFIG: VmCheckConfig = {
   maxImageAgeMs: 15 * 60 * 1000,
   injectionTtlMs: 120_000,
   stagingRetryMs: 5_000,
+  mediaDir: defaultMediaDir(),
   diagLogPath: defaultDiagLogPath(),
 };
 
@@ -70,6 +79,7 @@ export function normalizeConfig(raw: Record<string, unknown> | undefined): VmChe
     maxImageAgeMs: pick<number>("maxImageAgeMs") ?? DEFAULT_CONFIG.maxImageAgeMs,
     injectionTtlMs: pick<number>("injectionTtlMs") ?? DEFAULT_CONFIG.injectionTtlMs,
     stagingRetryMs: pick<number>("stagingRetryMs") ?? DEFAULT_CONFIG.stagingRetryMs,
+    mediaDir: pick<string>("mediaDir") ?? DEFAULT_CONFIG.mediaDir,
     diagLogPath: pick<string>("diagLogPath") ?? DEFAULT_CONFIG.diagLogPath,
   };
 }

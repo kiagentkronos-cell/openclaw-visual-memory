@@ -7,9 +7,12 @@
  * keep the newest half (line-aligned) so the file never grows unbounded.
  *
  * Decision vocabulary (exact names the handler logs):
- *   disabled | no_image | staging_pending_skip | dedup_skip | image_found
- *   check_started | check_hits <N> | check_miss | check_error <REASON>
- *   check_timeout | injected | inject_failed <REASON>
+ *   disabled | no_image | prompt_fire | staging_pending_skip | dedup_skip
+ *   image_found | check_started | check_hits <N> | check_miss
+ *   check_error <REASON> | check_timeout | injected | inject_failed
+ *
+ * `prompt_fire` is one line per before_prompt_build hook fire (the
+ * channel-agnostic seam that also covers WhatsApp), whatever it decided. <REASON>
  *
  * Line format (single line, key=value, machine-greppable):
  *   2026-09-29T08:40:12.345Z msg=3EB0ABCD1234 channel=whatsapp decision=check_hits hits=1
@@ -22,6 +25,7 @@ import { createHash } from "node:crypto";
 export type DiagKind =
   | "disabled"
   | "no_image"
+  | "prompt_fire"
   | "staging_pending_skip"
   | "dedup_skip"
   | "image_found"
