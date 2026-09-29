@@ -13,13 +13,18 @@
  *    flow. The result is delivered to the agent via
  *    api.session.workflow.enqueueNextTurnInjection (documented current seam;
  *    the top-level api.enqueueNextTurnInjection alias is deprecated).
- * 4. mediaStagingPending events are skipped; the later staged event for the
- *    same messageId runs the check. A messageId-keyed ledger makes the whole
- *    path idempotent (no double checks, no double injections).
+ * 4. When mediaStagingPending is set, the handler schedules ONE delayed
+ *    probe of the originalMedia paths (existence-guarded); a later staged
+ *    event may or may not arrive, so waiting for it alone is not an option
+ *    (message_received fires once per accepted turn in host dispatch).
+ *    A messageId-keyed ledger makes the whole path idempotent (no double
+ *    checks, no double injections).
  *
- * Failure policy: any CLI error/timeout injects NOTHING (never invent a
- * result); errors go to the plugin log only. Image contents are never
- * logged; only file paths (internal) and hit labels appear anywhere.
+ * Result protocol: every processed image message injects exactly one line
+ * (hits / "keine Treffer" / "Check nicht verfügbar (reason)") so the agent
+ * never guesses or re-checks manually. Errors also go to the plugin log;
+ * image contents are never logged; only internal paths and hit labels
+ * appear anywhere.
  *
  * Note on `openclaw plugins validate`: that command checks tool/feature
  * authoring metadata (defineToolPlugin/defineFeaturePlugin entries). This is
