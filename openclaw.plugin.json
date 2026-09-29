@@ -1,0 +1,60 @@
+{
+  "id": "visual-memory",
+  "name": "Visual Memory",
+  "description": "Checks every inbound image against the local Visual Memory register (vm.py) and provides the result to the agent as next-turn context.",
+  "version": "0.1.0",
+  "categories": ["other"],
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "Master switch for the image check hook."
+      },
+      "workspaceDir": {
+        "type": "string",
+        "description": "Workspace containing scripts/visual-memory (the vm.py tool repository). Defaults to the OpenClaw workspace under the host user home (~/.openclaw/workspace)."
+      },
+      "vmScriptRelPath": {
+        "type": "string",
+        "default": "scripts/visual-memory/vm.py",
+        "description": "vm.py path relative to workspaceDir."
+      },
+      "venvRelPath": {
+        "type": "string",
+        "default": "scripts/visual-memory/venv/bin/python",
+        "description": "Python interpreter path relative to workspaceDir."
+      },
+      "checkTimeoutMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 120000,
+        "default": 30000,
+        "description": "Hard timeout for one vm.py check run; on timeout nothing is injected."
+      },
+      "maxImageSizeBytes": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 20971520,
+        "description": "Images larger than this are skipped (guard against oversized media)."
+      },
+      "maxImageAgeMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "default": 900000,
+        "description": "Skip images whose mtime is older than this (stale replay guard)."
+      },
+      "injectionTtlMs": {
+        "type": "integer",
+        "minimum": 5000,
+        "default": 120000,
+        "description": "Next-turn injection TTL: results that arrive after this window are dropped instead of injected into an unrelated turn."
+      }
+    }
+  }
+}

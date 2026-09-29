@@ -1,0 +1,16 @@
+{
+  "name": "openclaw-visual-memory",
+  "version": "0.1.0",
+  "description": "Visual Memory hook for OpenClaw: runs the local vm.py register check on every inbound image and injects the result into the next agent turn.",
+  "type": "module",
+  "license": "MIT",
+  "peerDependencies": {
+    "openclaw": ">=2026.9.6"
+  },
+  "openclaw": {
+    "extensions": ["./index.ts"],
+    "compat": {
+      "pluginApi": ">=2026.9.6"
+    }
+  }
+}

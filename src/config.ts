@@ -1,0 +1,61 @@
+/**
+ * Config normalization for the visual-memory hook plugin.
+ *
+ * All values come from `api.pluginConfig` (validated against the manifest
+ * configSchema). This module applies the documented defaults and keeps a
+ * single normalized shape the rest of the plugin can rely on.
+ */
+
+export interface VmCheckConfig {
+  /** Master switch; false disables the hook entirely. */
+  enabled: boolean;
+  /** Workspace that contains scripts/visual-memory (vm.py tool repository). */
+  workspaceDir: string;
+  /** vm.py relative to workspaceDir. */
+  vmScriptRelPath: string;
+  /** Python interpreter relative to workspaceDir. */
+  venvRelPath: string;
+  /** Hard timeout for one vm.py check invocation. */
+  checkTimeoutMs: number;
+  /** Skip images larger than this (bytes). */
+  maxImageSizeBytes: number;
+  /** Skip images whose mtime is older than this (ms). */
+  maxImageAgeMs: number;
+  /** TTL for the next-turn injection. */
+  injectionTtlMs: number;
+}
+
+/** Derive the OpenClaw workspace from $HOME so no personal paths are hardcoded. */
+function defaultWorkspaceDir(): string {
+  const home = process.env.HOME ?? process.env.USERPROFILE ?? "~";
+  return `${home.replace(/\/+$/, "")}/.openclaw/workspace`;
+}
+
+export const DEFAULT_CONFIG: VmCheckConfig = {
+  enabled: true,
+  workspaceDir: defaultWorkspaceDir(),
+  vmScriptRelPath: "scripts/visual-memory/vm.py",
+  venvRelPath: "scripts/visual-memory/venv/bin/python",
+  checkTimeoutMs: 30_000,
+  maxImageSizeBytes: 20 * 1024 * 1024,
+  maxImageAgeMs: 15 * 60 * 1000,
+  injectionTtlMs: 120_000,
+};
+
+/** Merge raw pluginConfig (possibly undefined/empty) over the defaults. */
+export function normalizeConfig(raw: Record<string, unknown> | undefined): VmCheckConfig {
+  const pick = <T>(key: keyof VmCheckConfig): T | undefined => {
+    const value = raw?.[key as string];
+    return value === undefined ? undefined : (value as T);
+  };
+  return {
+    enabled: pick<boolean>("enabled") ?? DEFAULT_CONFIG.enabled,
+    workspaceDir: pick<string>("workspaceDir") ?? DEFAULT_CONFIG.workspaceDir,
+    vmScriptRelPath: pick<string>("vmScriptRelPath") ?? DEFAULT_CONFIG.vmScriptRelPath,
+    venvRelPath: pick<string>("venvRelPath") ?? DEFAULT_CONFIG.venvRelPath,
+    checkTimeoutMs: pick<number>("checkTimeoutMs") ?? DEFAULT_CONFIG.checkTimeoutMs,
+    maxImageSizeBytes: pick<number>("maxImageSizeBytes") ?? DEFAULT_CONFIG.maxImageSizeBytes,
+    maxImageAgeMs: pick<number>("maxImageAgeMs") ?? DEFAULT_CONFIG.maxImageAgeMs,
+    injectionTtlMs: pick<number>("injectionTtlMs") ?? DEFAULT_CONFIG.injectionTtlMs,
+  };
+}
