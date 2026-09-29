@@ -14,10 +14,22 @@ import type { DiagRecord } from "../src/diaglog.ts";
 import { registerMessageHook, type ApiLike } from "../src/entry.ts";
 
 async function fakeImage(name = "photo.jpg"): Promise<string> {
+  const dir = await fakeMediaImage(name);
+  return dir.file;
+}
+
+/**
+ * Image inside a fresh temp media dir (prompt-note gate, Hyperion review
+ * 1c4c01d Minor-1: only paths under mediaDir survive note parsing, so
+ * prompt-build fixtures must live inside the media dir they configure).
+ */
+async function fakeMediaImage(name = "photo.jpg"): Promise<{ dir: string; file: string }> {
   const dir = await mkdtemp(path.join(tmpdir(), "vmhook-p-"));
-  const file = path.join(dir, name);
+  const inbound = path.join(dir, "inbound");
+  await mkdir(inbound, { recursive: true });
+  const file = path.join(inbound, name);
   await writeFile(file, Buffer.alloc(8, 9));
-  return file;
+  return { dir, file };
 }
 
 function okSpawn(stdout = '{"ok":true,"hits":[{"name":"Alice","kind":"person","score":0.72,"confidence":"certain"}]}'): {
@@ -75,9 +87,9 @@ function makeDeps(overrides: Partial<HandlerDeps> & { spawn: SpawnFn }): {
 }
 
 test("WhatsApp path: prompt media note triggers check + injection", async () => {
-  const img = await fakeImage();
+  const { dir, file: img } = await fakeMediaImage();
   const { spawn, calls } = okSpawn();
-  const { deps, enqueued, diag } = makeDeps({ spawn });
+  const { deps, enqueued, diag } = makeDeps({ spawn, mediaDir: dir });
   const decision = handlePromptBuild(
     {
       prompt: `[media attached: ${img} (image/jpeg)]\nWer ist auf dem Foto?`,
@@ -111,9 +123,9 @@ test("prompt hook fires and logs a decision even without any image", async () =>
 });
 
 test("prompt path dedupes against the message_received check on the same path", async () => {
-  const img = await fakeImage();
+  const { dir, file: img } = await fakeMediaImage();
   const { spawn, calls } = okSpawn();
-  const { deps, enqueued, diag } = makeDeps({ spawn });
+  const { deps, enqueued, diag } = makeDeps({ spawn, mediaDir: dir });
   // webchat: message_received fires first and claims the path.
   const first = handleMessageReceived(
     { messageId: "wc1", sessionKey: "agent:main:webchat:x", media: [{ path: img, kind: "image" }] },

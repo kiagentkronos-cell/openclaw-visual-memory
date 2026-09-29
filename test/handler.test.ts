@@ -305,9 +305,9 @@ test("session key falls back from event to ctx", async () => {
   assert.equal(enqueued[0]?.sessionKey, "ctx-session");
 });
 
-test("image without session key → skipped, no injection", async () => {
+test("image without session key → skipped, no injection, nothing claimed", async () => {
   const image = await fakeImage();
-  const { spawn } = fakeSpawn({ stdout: '{"ok":true,"hits":[]}' });
+  const { spawn, calls } = fakeSpawn({ stdout: '{"ok":true,"hits":[]}' });
   const { deps, enqueued } = makeDeps({ spawn });
   const decision = handleMessageReceived(
     { messageId: "m-nosess", media: [{ kind: "image", path: image }] },
@@ -316,6 +316,22 @@ test("image without session key → skipped, no injection", async () => {
   );
   assert.equal(decision.action, "no-image");
   assert.equal(enqueued.length, 0);
+  // Hardening (Hyperion review 1c4c01d, Minor-2): without a sessionKey the
+  // handler must claim NOTHING — neither the message key nor the image
+  // path — so a later delivery that does resolve a session still gets
+  // checked instead of silently deduping against an unchecked claim.
+  assert.equal(deps.processed.has("id:m-nosess"), false, "message key must stay unclaimed");
+  assert.equal(deps.processed.hasPath(image), false, "image path must stay unclaimed");
+  // Same message again WITH a session → still checked (not deduped).
+  const again = handleMessageReceived(
+    { messageId: "m-nosess", media: [{ kind: "image", path: image }] },
+    { sessionKey: "s1" },
+    deps,
+  );
+  assert.equal(again.action, "queued");
+  if (again.action === "queued") await again.check;
+  assert.equal(calls.calls, 1);
+  assert.equal(enqueued.length, 1);
 });
 
 test("multiple images in one message → one merged injection", async () => {

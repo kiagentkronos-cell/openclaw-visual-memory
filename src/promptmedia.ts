@@ -25,8 +25,17 @@
  * The notes carry no mtime, so history re-projection of an old note cannot
  * retrigger a check through the age guard alone — the caller therefore also
  * claims image paths in the ledger (claimPath) before running a check.
+ *
+ * Hardening (Hyperion review 1c4c01d, Minor-1): the note text is user-prompt
+ * content — anyone can type a `[media attached: /etc/passwd.jpg]` line. A
+ * parsed local path is therefore only accepted when it lies BELOW the managed
+ * media store (mediaDir, or mediaDir/inbound for media:// aliases). The check
+ * is path.resolve + prefix-test after resolve, plus a realpath re-check for
+ * symlinks where realpath is available. Everything else is dropped here (no
+ * fact, no ledger claim, no check).
  */
 
+import fs from "node:fs";
 import path from "node:path";
 import type { MediaFactLike } from "./media.ts";
 
@@ -36,6 +45,36 @@ const MEDIA_NOTE_LINE = /\[media attached(?:\s+\d+\/\d+)?:\s*([^\]]+)\]/gi;
 const IMAGE_EXTENSIONS = new Set([
   ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".heif", ".tif", ".tiff",
 ]);
+
+/** True when `resolved` is `base` itself or below it (both already resolved). */
+function isUnder(base: string, resolved: string): boolean {
+  const prefix = base.endsWith(path.sep) ? base : base + path.sep;
+  return resolved === base || resolved.startsWith(prefix);
+}
+
+/**
+ * Media-dir gate for note-carried local paths (Minor-1). Accepts only
+ * absolute paths that canonicalize (path.resolve) to a location under
+ * mediaDir; a typed note pointing elsewhere (/etc/passwd.jpg,
+ * /home/x/.ssh/id_rsa.jpg, `..` escapes) yields undefined. When the target
+ * exists, realpath additionally pins symlinked files to the media dir. A
+ * missing file keeps the resolve-only verdict (checker.ts probes readable
+ * existence later; history notes for deleted files must not be poisoned).
+ */
+function gateMediaPath(candidate: string, mediaDir: string): string | undefined {
+  if (!path.isAbsolute(candidate)) return undefined;
+  const base = path.resolve(mediaDir);
+  const resolved = path.resolve(candidate);
+  if (!isUnder(base, resolved)) return undefined;
+  try {
+    const real = fs.realpathSync(resolved);
+    // Symlinked file: the canonical target must also lie inside the media dir.
+    if (!isUnder(base, path.resolve(real))) return undefined;
+  } catch {
+    // realpath unavailable (file missing, permissions): resolve verdict stands.
+  }
+  return resolved;
+}
 
 /** Kind guess from the file name when the note carries no mime. */
 function kindFromPath(p: string): string | undefined {
@@ -94,7 +133,17 @@ function parseNotePayload(payload: string, mediaDir: string): MediaFactLike | un
     : kindFromPath(factPath ?? trimmed);
 
   const fact: MediaFactLike = {};
-  if (factPath) fact.path = factPath;
+  if (factPath) {
+    // Minor-1 gate: only paths inside the managed media store survive.
+    const gated = gateMediaPath(factPath, mediaDir);
+    if (gated === undefined) {
+      // Rejected local path: keep any independent url fact, otherwise drop
+      // the note entirely (no fact, no claim, no check).
+      if (!url) return undefined;
+    } else {
+      fact.path = gated;
+    }
+  }
   if (factUrl) fact.url = factUrl;
   if (contentType) fact.contentType = contentType;
   if (kind) fact.kind = kind;

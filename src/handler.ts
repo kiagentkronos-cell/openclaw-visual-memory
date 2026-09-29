@@ -246,6 +246,18 @@ export function handleMessageReceived(
     return { action: "no-image" };
   }
 
+  const sessionKey = resolveSessionKey(event, ctx);
+  if (!sessionKey) {
+    // Without a session there is no next turn to inject into. Hardening
+    // (Hyperion review 1c4c01d, Minor-2): this check runs BEFORE any ledger
+    // claim — claiming message key/paths without a session would mark the
+    // images handled while nothing was ever checked, silently disarming the
+    // prompt-build seam for the same files.
+    deps.log.warn("visual-memory: image message without resolvable sessionKey; skipped");
+    log("no_image", { reason: "no_session" });
+    return { action: "no-image", reason: "no_session" };
+  }
+
   if (!deps.processed.claim(key)) {
     log("dedup_skip");
     return { action: "duplicate" };
@@ -253,14 +265,6 @@ export function handleMessageReceived(
   // Claim the paths too: the prompt-build seam must not re-check them.
   for (const image of images) deps.processed.claimPath(image);
   log("image_found", { images: images.length });
-
-  const sessionKey = resolveSessionKey(event, ctx);
-  if (!sessionKey) {
-    // Without a session there is no next turn to inject into.
-    deps.log.warn("visual-memory: image message without resolvable sessionKey; skipped");
-    log("no_image", { reason: "no_session" });
-    return { action: "no-image", reason: "no_session" };
-  }
 
   log("check_started", { images: images.length });
   const check = runCheckAndInject(images, sessionKey, key, msgId, channel, deps);
