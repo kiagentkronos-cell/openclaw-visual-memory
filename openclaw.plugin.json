@@ -2,7 +2,7 @@
   "id": "visual-memory",
   "name": "Visual Memory",
   "description": "Checks every inbound image against the local Visual Memory register (vm.py) and injects the result synchronously into the same prompt turn (Gateway waits, active-memory parity).",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "categories": [
     "other"
   ],
