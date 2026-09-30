@@ -16,6 +16,7 @@ import {
 } from "./handler.ts";
 import type { SpawnFn } from "./checker.ts";
 import { FileDiagSink, NULL_DIAG_SINK, type DiagSink } from "./diaglog.ts";
+import { FileTranscriptSink, NULL_TRANSCRIPT_SINK, type TranscriptSink } from "./transcript.ts";
 
 /** Minimal structural view of the parts of OpenClawPluginApi we touch. */
 export interface ApiLike {
@@ -48,6 +49,8 @@ export interface EntryDeps {
   now?: () => number;
   /** Diagnostic sink override (tests); production writes the diag log file. */
   diag?: DiagSink;
+  /** Transcript sink override (tests); production writes per-run JSONL files. */
+  transcripts?: TranscriptSink;
   /** Scheduler override (fake timers in tests); production uses setTimeout. */
   schedule?: (fn: () => void, delayMs: number) => unknown;
   /** Existence probe override (tests); production uses fs.existsSync. */
@@ -73,6 +76,9 @@ export function buildDeps(api: ApiLike, config: VmCheckConfig, extras: EntryDeps
     diag:
       extras.diag ??
       new FileDiagSink(config.diagLogPath, 1_048_576, extras.now ?? Date.now),
+    transcripts:
+      extras.transcripts ??
+      new FileTranscriptSink(config.transcriptDir, config.transcriptMaxFiles, extras.now ?? Date.now),
     schedule: extras.schedule ?? ((fn, delayMs) => setTimeout(fn, delayMs)),
     fileExists: extras.fileExists ?? ((p) => existsSync(p)),
     mediaDir: config.mediaDir,

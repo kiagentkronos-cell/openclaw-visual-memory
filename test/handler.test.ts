@@ -73,6 +73,8 @@ const makeDeps = (
       stagingRetryMs: 5000,
       mediaDir: "/ws/media",
       diagLogPath: "/tmp/vm-hook-test-diag.log",
+      transcriptDir: "/tmp/vm-hook-test-transcripts",
+      transcriptMaxFiles: 200,
     },
     pythonPath: "/fake/python",
     scriptPath: "/fake/vm.py",
@@ -281,6 +283,8 @@ test("disabled config → nothing happens", async () => {
       stagingRetryMs: 5000,
       mediaDir: "/ws/media",
       diagLogPath: "/tmp/vm-hook-test-diag.log",
+      transcriptDir: "/tmp/vm-hook-test-transcripts",
+      transcriptMaxFiles: 200,
     },
   });
   const decision = handleMessageReceived(

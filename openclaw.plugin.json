@@ -69,6 +69,17 @@
       "diagLogPath": {
         "type": "string",
         "description": "Decision-path diagnostics log file (metadata only, 1 MB size cap). Defaults to ~/.openclaw/logs/visual-memory-hook.log."
+      },
+      "transcriptDir": {
+        "type": "string",
+        "description": "Directory for per-run JSONL transcripts (Active-Memory analogue). Defaults to ~/.openclaw/plugins/visual-memory/transcripts."
+      },
+      "transcriptMaxFiles": {
+        "type": "integer",
+        "minimum": 10,
+        "maximum": 10000,
+        "default": 200,
+        "description": "Retention: keep at most this many transcript files; the oldest are pruned after each run."
       }
     }
   }

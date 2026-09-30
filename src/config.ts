@@ -29,6 +29,10 @@ export interface VmCheckConfig {
   mediaDir: string;
   /** Decision-path diagnostic log file (metadata only, size-capped). */
   diagLogPath: string;
+  /** Directory for per-run JSONL transcripts (Active-Memory analogue). */
+  transcriptDir: string;
+  /** Keep at most this many transcript files (oldest pruned after each run). */
+  transcriptMaxFiles: number;
 }
 
 /** Derive the OpenClaw workspace from $HOME so no personal paths are hardcoded. */
@@ -49,6 +53,12 @@ function defaultMediaDir(): string {
   return `${home.replace(/\/+$/, "")}/.openclaw/media`;
 }
 
+/** Default transcript dir: plugin state dir (Active Memory convention). */
+function defaultTranscriptDir(): string {
+  const home = process.env.HOME ?? process.env.USERPROFILE ?? "~";
+  return `${home.replace(/\/+$/, "")}/.openclaw/plugins/visual-memory/transcripts`;
+}
+
 export const DEFAULT_CONFIG: VmCheckConfig = {
   enabled: true,
   workspaceDir: defaultWorkspaceDir(),
@@ -61,6 +71,8 @@ export const DEFAULT_CONFIG: VmCheckConfig = {
   stagingRetryMs: 5_000,
   mediaDir: defaultMediaDir(),
   diagLogPath: defaultDiagLogPath(),
+  transcriptDir: defaultTranscriptDir(),
+  transcriptMaxFiles: 200,
 };
 
 /** Merge raw pluginConfig (possibly undefined/empty) over the defaults. */
@@ -81,5 +93,8 @@ export function normalizeConfig(raw: Record<string, unknown> | undefined): VmChe
     stagingRetryMs: pick<number>("stagingRetryMs") ?? DEFAULT_CONFIG.stagingRetryMs,
     mediaDir: pick<string>("mediaDir") ?? DEFAULT_CONFIG.mediaDir,
     diagLogPath: pick<string>("diagLogPath") ?? DEFAULT_CONFIG.diagLogPath,
+    transcriptDir: pick<string>("transcriptDir") ?? DEFAULT_CONFIG.transcriptDir,
+    transcriptMaxFiles:
+      pick<number>("transcriptMaxFiles") ?? DEFAULT_CONFIG.transcriptMaxFiles,
   };
 }

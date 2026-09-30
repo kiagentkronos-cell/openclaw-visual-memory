@@ -70,6 +70,8 @@ function makeDeps(overrides: Partial<HandlerDeps> & { spawn: SpawnFn }): {
       injectionTtlMs: 60000,
       stagingRetryMs: 5000,
       diagLogPath: "/tmp/vm-hook-test-diag.log",
+      transcriptDir: "/tmp/vm-hook-test-transcripts",
+      transcriptMaxFiles: 200,
       mediaDir: "/ws/media",
     },
     pythonPath: "/fake/python",
@@ -193,6 +195,8 @@ test("real WhatsApp note in workspace media dir triggers check + injection", asy
       injectionTtlMs: 60000,
       stagingRetryMs: 5000,
       diagLogPath: "/tmp/vm-hook-test-diag.log",
+      transcriptDir: "/tmp/vm-hook-test-transcripts",
+      transcriptMaxFiles: 200,
       mediaDir: "/nonexistent-state/.openclaw/media",
     },
   });

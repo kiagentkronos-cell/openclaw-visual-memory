@@ -63,6 +63,9 @@ import { buildInjectionText, type VmCheckOutcome, type VmHit } from "./injection
 import { checkImage, type CheckResult, type SpawnFn } from "./checker.ts";
 import type { VmCheckConfig } from "./config.ts";
 import { shortMessageId, type DiagKind, type DiagSink } from "./diaglog.ts";
+import { NULL_TRANSCRIPT_SINK, type TranscriptRun, type TranscriptSink } from "./transcript.ts";
+import { createHash } from "node:crypto";
+import { stat } from "node:fs/promises";
 
 export interface ReceivedEventLike {
   content?: string;
@@ -152,6 +155,8 @@ export interface HandlerDeps {
   processed: MessageLedger;
   /** Decision-path diagnostics (metadata only). */
   diag: DiagSink;
+  /** Per-run JSONL transcripts (Active-Memory analogue; deep reconstruction). */
+  transcripts?: TranscriptSink;
   /**
    * Scheduler for the staging-pending retry. Production uses setTimeout;
    * tests inject a fake clock. Returns a cancellable handle we do not use
@@ -360,7 +365,10 @@ export function handlePromptBuild(
   const key = `path:${fresh.join(",")}`;
   log("image_found", { images: fresh.length });
   log("check_started", { images: fresh.length });
-  const check = runCheckAndInject(fresh, sessionKey, key, msgId, channel, deps);
+  const check = runCheckAndInject(fresh, sessionKey, key, msgId, channel, deps, {
+    seam: "before_prompt_build",
+    trigger: ctx.trigger,
+  });
   return { action: "queued", check };
 }
 
@@ -436,23 +444,61 @@ async function runCheckAndInject(
   msgId: string,
   channel: string | undefined,
   deps: HandlerDeps,
+  transcriptMeta?: Record<string, unknown>,
 ): Promise<void> {
   const log = (decision: DiagKind, extra?: { reason?: string; hits?: number }) =>
     deps.diag.record({ msgId, channel, decision, ...extra });
 
+  // Deep per-run transcript (Active-Memory analogue, operator order 30.09).
+  const run: TranscriptRun = (deps.transcripts ?? NULL_TRANSCRIPT_SINK).begin({
+    id: `vmrun-${shortMessageId(messageKeyStr, messageKeyStr)}`,
+    seam: "check",
+    channel,
+    sessionKey,
+    images: images.length,
+    ...transcriptMeta,
+  });
+  const startedAt = (deps.now ?? Date.now)();
+
+  // Image identity lines: path + content-free hash + stat only, never bytes.
+  for (const image of images) {
+    const info: Record<string, unknown> = {
+      type: "image",
+      path: image,
+      sha256: createHash("sha256").update(image).digest("hex").slice(0, 16),
+    };
+    try {
+      const st = await stat(image);
+      info.sizeBytes = st.size;
+      info.mtimeMs = st.mtimeMs;
+    } catch {
+      info.exists = false;
+    }
+    run.record(info);
+  }
+
   const outcomes: CheckResult[] = [];
   for (const image of images) {
-    outcomes.push(
-      await checkImage(image, {
-        pythonPath: deps.pythonPath,
-        scriptPath: deps.scriptPath,
-        timeoutMs: deps.config.checkTimeoutMs,
-        maxSizeBytes: deps.config.maxImageSizeBytes,
-        maxAgeMs: deps.config.maxImageAgeMs,
-        spawn: deps.spawn,
-        now: deps.now,
-      }),
-    );
+    const checkStarted = (deps.now ?? Date.now)();
+    const result = await checkImage(image, {
+      pythonPath: deps.pythonPath,
+      scriptPath: deps.scriptPath,
+      timeoutMs: deps.config.checkTimeoutMs,
+      maxSizeBytes: deps.config.maxImageSizeBytes,
+      maxAgeMs: deps.config.maxImageAgeMs,
+      spawn: deps.spawn,
+      now: deps.now,
+    });
+    outcomes.push(result);
+    const checkLine: Record<string, unknown> = {
+      type: "check",
+      path: image,
+      status: result.status,
+      durationMs: (deps.now ?? Date.now)() - checkStarted,
+    };
+    if (result.status === "ok") checkLine.hits = result.hits;
+    else checkLine.reason = result.reason;
+    run.record(checkLine);
   }
 
   // One line per check outcome so every image's fate is greppable.
@@ -508,13 +554,15 @@ async function runCheckAndInject(
     outcome = { status: "ok", hits: [...best.values()] };
   }
   const text = buildInjectionText(outcome);
+  const idempotencyKey = `visual-memory:${sessionKey}:${messageKeyStr}`;
+  run.record({ type: "inject", text, idempotencyKey, ttlMs: deps.config.injectionTtlMs });
   try {
     const result = await deps.enqueue({
       sessionKey,
       text,
       // One injection per message+session: covers re-delivery of the same
       // message and lets the host dedupe pending entries.
-      idempotencyKey: `visual-memory:${sessionKey}:${messageKeyStr}`,
+      idempotencyKey,
       ttlMs: deps.config.injectionTtlMs,
     });
     // The host refuses WITHOUT throwing ({ enqueued: false }) when the
@@ -523,14 +571,21 @@ async function runCheckAndInject(
     if (result && typeof result === "object" && result.enqueued === false) {
       log("inject_failed", { reason: "host_refused" });
       deps.log.error("visual-memory: enqueue refused by host (enqueued=false)");
+      run.done({ decision: "inject_failed", reason: "host_refused", durationMs: (deps.now ?? Date.now)() - startedAt });
       return;
     }
     log("injected", {
       hits: outcome.status === "ok" ? outcome.hits.length : 0,
     });
+    run.done({
+      decision: "injected",
+      hitsTotal: outcome.status === "ok" ? outcome.hits.length : 0,
+      durationMs: (deps.now ?? Date.now)() - startedAt,
+    });
   } catch (err) {
     log("inject_failed", { reason: reasonToken(String(err)) });
     deps.log.error(`visual-memory: enqueue failed (${String(err)})`);
+    run.done({ decision: "inject_failed", reason: reasonToken(String(err)), durationMs: (deps.now ?? Date.now)() - startedAt });
   }
 }
 
