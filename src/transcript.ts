@@ -10,9 +10,10 @@
  *
  *   {"type":"run", id, ts, seam, channel, sessionKey, trigger, images}
  *   {"type":"fire", ...}          — extra context the seam learned later
- *   {"type":"image", path, sha256, sizeBytes, mtimeMs}   (path+hash only, NEVER image bytes)
+ *   {"type":"image", path, pathhash, sizeBytes, mtimeMs} (path+hash only, NEVER image bytes;
+ *                                                          pathhash = sha256 over the PATH string, not file content)
  *   {"type":"check", path, status, hits|reason, durationMs}  (vm.py stdout as parsed hits JSON incl. scores)
- *   {"type":"inject", text, idempotencyKey, enqueued}   (verbatim injected block)
+ *   {"type":"inject", text, idempotencyKey, ttlMs}      (verbatim injected block; the enqueue verdict lands in done.decision)
  *   {"type":"done", decision, hitsTotal, durationMs}
  *
  * The decision-path diaglog (diaglog.ts) stays the fast grep-able one-liner

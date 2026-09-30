@@ -465,7 +465,9 @@ async function runCheckAndInject(
     const info: Record<string, unknown> = {
       type: "image",
       path: image,
-      sha256: createHash("sha256").update(image).digest("hex").slice(0, 16),
+      // pathhash, NOT a content hash: identity of the note path for dedupe
+      // forensics; the image bytes are never read into the transcript.
+      pathhash: createHash("sha256").update(image).digest("hex").slice(0, 16),
     };
     try {
       const st = await stat(image);

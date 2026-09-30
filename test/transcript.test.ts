@@ -109,7 +109,7 @@ test("transcript written per image run with hits (full reconstruction)", async (
   assert.equal(meta.sessionKey, "agent:main:whatsapp:direct:+49x");
   const image = lines.find((l) => l.type === "image");
   assert.ok(image && typeof image.path === "string" && image.path === img);
-  assert.ok(typeof image.sha256 === "string" && (image.sha256 as string).length === 16);
+  assert.ok(typeof image.pathhash === "string" && (image.pathhash as string).length === 16);
   const check = lines.find((l) => l.type === "check");
   assert.ok(check && check.status === "ok");
   const hits = check.hits as Array<Record<string, unknown>>;
