@@ -28,11 +28,20 @@
  *
  * Hardening (Hyperion review 1c4c01d, Minor-1): the note text is user-prompt
  * content — anyone can type a `[media attached: /etc/passwd.jpg]` line. A
- * parsed local path is therefore only accepted when it lies BELOW the managed
- * media store (mediaDir, or mediaDir/inbound for media:// aliases). The check
- * is path.resolve + prefix-test after resolve, plus a realpath re-check for
- * symlinks where realpath is available. Everything else is dropped here (no
- * fact, no ledger claim, no check).
+ * parsed local path is therefore only accepted when it lies BELOW an allowed
+ * media store root. The check is path.resolve + prefix-test after resolve,
+ * plus a realpath re-check for symlinks where realpath is available.
+ * Everything else is dropped here (no fact, no ledger claim, no check).
+ *
+ * Root cause 2 (2026-09-30, WhatsApp silent path): on this host WhatsApp
+ * inbound images are written to <workspaceDir>/media/inbound/ (e.g.
+ * openclaw-media-TIMESTAMP-RAND.jpg DIRECTLY there, no openclaw-staged
+ * subfolder), while the state media store is <stateDir>/media. The old gate
+ * allowed ONLY the state media dir, so every real WhatsApp note resolved to
+ * zero facts (prompt_fire without image_found, forever silent). The gate now
+ * accepts an allow-LIST of roots (state media dir + workspace media dir);
+ * absolute-path notes still need to be under one of them, so the typed-note
+ * protection stays intact.
  */
 
 import fs from "node:fs";
@@ -54,22 +63,23 @@ function isUnder(base: string, resolved: string): boolean {
 
 /**
  * Media-dir gate for note-carried local paths (Minor-1). Accepts only
- * absolute paths that canonicalize (path.resolve) to a location under
- * mediaDir; a typed note pointing elsewhere (/etc/passwd.jpg,
+ * absolute paths that canonicalize (path.resolve) to a location under one
+ * of the allowed roots; a typed note pointing elsewhere (/etc/passwd.jpg,
  * /home/x/.ssh/id_rsa.jpg, `..` escapes) yields undefined. When the target
- * exists, realpath additionally pins symlinked files to the media dir. A
+ * exists, realpath additionally pins symlinked files to an allowed root. A
  * missing file keeps the resolve-only verdict (checker.ts probes readable
  * existence later; history notes for deleted files must not be poisoned).
  */
-function gateMediaPath(candidate: string, mediaDir: string): string | undefined {
+function gateMediaPath(candidate: string, allowedDirs: string[]): string | undefined {
   if (!path.isAbsolute(candidate)) return undefined;
-  const base = path.resolve(mediaDir);
   const resolved = path.resolve(candidate);
-  if (!isUnder(base, resolved)) return undefined;
+  const bases = allowedDirs.map((d) => path.resolve(d)).filter((d) => d.length > 0);
+  if (!bases.some((base) => isUnder(base, resolved))) return undefined;
   try {
     const real = fs.realpathSync(resolved);
-    // Symlinked file: the canonical target must also lie inside the media dir.
-    if (!isUnder(base, path.resolve(real))) return undefined;
+    // Symlinked file: the canonical target must also lie inside a root.
+    const realResolved = path.resolve(real);
+    if (!bases.some((base) => isUnder(base, realResolved))) return undefined;
   } catch {
     // realpath unavailable (file missing, permissions): resolve verdict stands.
   }
@@ -84,7 +94,7 @@ function kindFromPath(p: string): string | undefined {
 }
 
 /** Resolve one note payload (`X` from the brackets) into a media fact. */
-function parseNotePayload(payload: string, mediaDir: string): MediaFactLike | undefined {
+function parseNotePayload(payload: string, ctx: ParseContext): MediaFactLike | undefined {
   let rest = payload.trim();
   if (rest.length === 0) return undefined;
   // A bare "N files" header line carries no path.
@@ -110,7 +120,7 @@ function parseNotePayload(payload: string, mediaDir: string): MediaFactLike | un
   let factUrl: string | undefined = url;
   const trimmed = pathPart.replace(/^"|"$/g, "").trim();
   if (trimmed.startsWith("media://inbound/")) {
-    factPath = path.join(mediaDir, "inbound", path.basename(trimmed.slice("media://".length)));
+    factPath = path.join(ctx.mediaDir, "inbound", path.basename(trimmed.slice("media://".length)));
   } else if (trimmed.includes("://")) {
     // Remote or other scheme: url-only, never a locally readable path.
     factUrl = factUrl ?? trimmed;
@@ -134,8 +144,8 @@ function parseNotePayload(payload: string, mediaDir: string): MediaFactLike | un
 
   const fact: MediaFactLike = {};
   if (factPath) {
-    // Minor-1 gate: only paths inside the managed media store survive.
-    const gated = gateMediaPath(factPath, mediaDir);
+    // Minor-1 gate: only paths inside an allowed media store survive.
+    const gated = gateMediaPath(factPath, ctx.allowedDirs);
     if (gated === undefined) {
       // Rejected local path: keep any independent url fact, otherwise drop
       // the note entirely (no fact, no claim, no check).
@@ -151,18 +161,39 @@ function parseNotePayload(payload: string, mediaDir: string): MediaFactLike | un
   return fact;
 }
 
+/** Parse context: alias base + allowed roots for the local-path gate. */
+export interface ParseContext {
+  /** Base for media://inbound aliases (the state media store). */
+  mediaDir: string;
+  /**
+   * Roots a note-carried absolute path may lie under. On real hosts this
+   * covers BOTH the state media store (<stateDir>/media) and the workspace
+   * media dir (<workspaceDir>/media) — WhatsApp writes inbound images into
+   * the workspace one (root cause 2, 2026-09-30).
+   */
+  allowedDirs: string[];
+}
+
+/** Back-compat: a bare mediaDir string is treated as the single allowed root. */
+function asContext(ctx: string | ParseContext): ParseContext {
+  if (typeof ctx === "string") return { mediaDir: ctx, allowedDirs: [ctx] };
+  const allowedDirs = ctx.allowedDirs.length > 0 ? ctx.allowedDirs : [ctx.mediaDir];
+  return { mediaDir: ctx.mediaDir, allowedDirs };
+}
+
 /**
  * Extract media facts from prompt text (and any message text the caller
  * wants scanned). Image facts have kind "image"; audio/video notes are
  * returned with their kind so callers can ignore them explicitly.
  * Order of appearance is preserved; duplicates (same path) are collapsed.
  */
-export function promptMediaFacts(text: string, mediaDir: string): MediaFactLike[] {
+export function promptMediaFacts(text: string, ctx: string | ParseContext): MediaFactLike[] {
+  const context = asContext(ctx);
   const facts: MediaFactLike[] = [];
   const seen = new Set<string>();
   if (typeof text !== "string" || text.length === 0) return facts;
   for (const match of text.matchAll(MEDIA_NOTE_LINE)) {
-    const fact = parseNotePayload(match[1] ?? "", mediaDir);
+    const fact = parseNotePayload(match[1] ?? "", context);
     if (!fact) continue;
     const key = fact.path ?? fact.url ?? "";
     if (key.length === 0 || seen.has(key)) continue;
@@ -173,8 +204,8 @@ export function promptMediaFacts(text: string, mediaDir: string): MediaFactLike[
 }
 
 /** Image-only convenience wrapper used by the prompt-build handler. */
-export function promptImageFacts(text: string, mediaDir: string): MediaFactLike[] {
-  return promptMediaFacts(text, mediaDir).filter((fact) => {
+export function promptImageFacts(text: string, ctx: string | ParseContext): MediaFactLike[] {
+  return promptMediaFacts(text, ctx).filter((fact) => {
     if (fact.kind !== undefined) return fact.kind === "image";
     if (typeof fact.contentType === "string") {
       return fact.contentType.toLowerCase().startsWith("image/");

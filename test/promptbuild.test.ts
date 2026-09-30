@@ -165,6 +165,118 @@ test("prompt media note with media://inbound alias resolves under mediaDir", asy
   assert.equal(enqueued.length, 1);
 });
 
+// Root cause 2 (2026-09-30): real WhatsApp notes point into the WORKSPACE
+// media dir (openclaw-media-<ts>-<rand>.jpg directly in media/inbound).
+// These fixtures prove the prompt seam now finds them via the config's
+// workspaceDir (allow-list gate) instead of silently returning no-image.
+test("real WhatsApp note in workspace media dir triggers check + injection", async () => {
+  // Fake image inside <workspaceDir>/media/inbound (host layout).
+  const ws = await mkdtemp(path.join(tmpdir(), "vmhook-ws-"));
+  const inbound = path.join(ws, "media", "inbound");
+  await mkdir(inbound, { recursive: true });
+  const img = path.join(inbound, "openclaw-media-1790721251603-v32ydr.jpg");
+  await writeFile(img, Buffer.alloc(8, 9));
+  const { spawn, calls } = okSpawn();
+  // mediaDir = state store (NOT containing the file); workspaceDir = the
+  // temp dir whose /media/inbound holds the image — exactly host reality.
+  const { deps, enqueued, diag } = makeDeps({
+    spawn,
+    mediaDir: "/nonexistent-state/.openclaw/media",
+    config: {
+      enabled: true,
+      workspaceDir: ws,
+      vmScriptRelPath: "vm.py",
+      venvRelPath: "venv/bin/python",
+      checkTimeoutMs: 1000,
+      maxImageSizeBytes: 0,
+      maxImageAgeMs: 0,
+      injectionTtlMs: 60000,
+      stagingRetryMs: 5000,
+      diagLogPath: "/tmp/vm-hook-test-diag.log",
+      mediaDir: "/nonexistent-state/.openclaw/media",
+    },
+  });
+  const decision = handlePromptBuild(
+    { prompt: `[media attached: ${img} (image/jpeg)]\nWas ist das?` },
+    { sessionKey: "agent:main:whatsapp:direct:+49x", channel: "whatsapp", trigger: "user" },
+    deps,
+  );
+  assert.equal(decision.action, "queued");
+  await (decision as { check: Promise<void> }).check;
+  assert.equal(calls.n, 1);
+  assert.equal(enqueued.length, 1);
+  assert.match(enqueued[0]!.text, /Treffer: Alice/);
+  assert.ok(diag.some((r) => r.decision === "image_found"));
+});
+
+test("always-inject: image with zero hits still injects the keine-Treffer block", async () => {
+  const { dir, file: img } = await fakeMediaImage();
+  const { spawn } = okSpawn('{"ok":true,"hits":[]}');
+  const { deps, enqueued } = makeDeps({ spawn, mediaDir: dir });
+  const decision = handlePromptBuild(
+    { prompt: `[media attached: ${img} (image/jpeg)]\nHallo` },
+    { sessionKey: "agent:main:whatsapp:direct:+49x", channel: "whatsapp", trigger: "user" },
+    deps,
+  );
+  assert.equal(decision.action, "queued");
+  await (decision as { check: Promise<void> }).check;
+  assert.equal(enqueued.length, 1);
+  assert.equal(enqueued[0]!.text, "[Visual Memory] keine Treffer");
+});
+
+test("always-inject: engine error injects the unavailable block, never silence", async () => {
+  const { dir, file: img } = await fakeMediaImage();
+  const { spawn } = okSpawn("boom");
+  // stdout boom + exit 0 → parse error → unavailable marker.
+  const { deps, enqueued } = makeDeps({ spawn, mediaDir: dir });
+  const decision = handlePromptBuild(
+    { prompt: `[media attached: ${img} (image/jpeg)]` },
+    { sessionKey: "agent:main:whatsapp:direct:+49x", channel: "whatsapp", trigger: "user" },
+    deps,
+  );
+  assert.equal(decision.action, "queued");
+  await (decision as { check: Promise<void> }).check;
+  assert.equal(enqueued.length, 1);
+  assert.match(enqueued[0]!.text, /^\[Visual Memory\] Check nicht verfügbar/);
+});
+
+test("no image in message → no block injected at all", async () => {
+  const { spawn } = okSpawn();
+  const { deps, enqueued } = makeDeps({ spawn });
+  const decision = handlePromptBuild(
+    { prompt: "nur text" },
+    { sessionKey: "agent:main:whatsapp:direct:+49x", channel: "whatsapp", trigger: "user" },
+    deps,
+  );
+  assert.equal(decision.action, "no-image");
+  assert.equal(enqueued.length, 0);
+});
+
+test("second prompt_fire same turn (trigger_manual) does not withdraw or double-inject", async () => {
+  const { dir, file: img } = await fakeMediaImage();
+  const { spawn, calls } = okSpawn();
+  const { deps, enqueued, diag } = makeDeps({ spawn, mediaDir: dir });
+  const first = handlePromptBuild(
+    { prompt: `[media attached: ${img} (image/jpeg)]\nhi` },
+    { sessionKey: "agent:main:whatsapp:direct:+49x", channel: "whatsapp", trigger: "user" },
+    deps,
+  );
+  assert.equal(first.action, "queued");
+  // Host re-resolves the same turn ~300ms later with trigger=manual.
+  const second = handlePromptBuild(
+    { prompt: `[media attached: ${img} (image/jpeg)]\nhi` },
+    { sessionKey: "agent:main:whatsapp:direct:+49x", channel: "whatsapp", trigger: "manual" },
+    deps,
+  );
+  // trigger_manual is a non-user trigger: no-image decision, no injection,
+  // and crucially nothing that could cancel the first fire's queued block.
+  assert.equal(second.action, "no-image");
+  await (first as { check: Promise<void> }).check;
+  assert.equal(calls.n, 1, "exactly one vm.py run");
+  assert.equal(enqueued.length, 1, "exactly one injection");
+  assert.ok(diag.some((r) => r.decision === "prompt_fire" && r.reason === "trigger_manual"));
+});
+
 test("registration wires message_received AND before_prompt_build", () => {
   const registered: string[] = [];
   const api: ApiLike = {

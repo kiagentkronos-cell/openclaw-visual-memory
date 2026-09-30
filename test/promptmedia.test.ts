@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { promptImageFacts } from "../src/promptmedia.ts";
+import { promptImageFacts, type ParseContext } from "../src/promptmedia.ts";
 
 const MEDIA_DIR = "/home/tester/.openclaw/media";
 
@@ -102,4 +102,54 @@ test("symlink inside media dir pointing inside survives", () => {
 
 test("no media note means no facts", () => {
   assert.deepEqual(promptImageFacts("ganz normaler text", MEDIA_DIR), []);
+});
+
+// Root cause 2 (2026-09-30): WhatsApp writes inbound images DIRECTLY into
+// <workspaceDir>/media/inbound/ as openclaw-media-<ts>-<rand>.<ext> — the
+// old state-media-dir-only gate dropped every real note (prompt_fire with
+// no image_found, silent forever). The gate must accept both roots.
+const WS_MEDIA = "/home/tester/.openclaw/workspace/media";
+const CTX: ParseContext = { mediaDir: MEDIA_DIR, allowedDirs: [MEDIA_DIR, WS_MEDIA] };
+
+test("workspace inbound openclaw-media-<ts>-<rand>.jpg is accepted (real WhatsApp format)", () => {
+  const prompt = [
+    "[media attached: /home/tester/.openclaw/workspace/media/inbound/openclaw-media-1790721251603-v32ydr.jpg (image/jpeg)]",
+    "Wer ist auf dem Foto?",
+  ].join("\n");
+  const facts = promptImageFacts(prompt, CTX);
+  assert.equal(facts.length, 1);
+  assert.equal(
+    facts[0]!.path,
+    "/home/tester/.openclaw/workspace/media/inbound/openclaw-media-1790721251603-v32ydr.jpg",
+  );
+  assert.equal(facts[0]!.kind, "image");
+});
+
+test("workspace staged subdir path is accepted too", () => {
+  const prompt =
+    "[media attached: /home/tester/.openclaw/workspace/media/inbound/openclaw-staged-8a2d072e-1b98-42a8-b278-fd852208301d/input-9c1e3a05-65fd-4453-9d64-a55e7b624f3a.jpg (image/jpeg)]";
+  const facts = promptImageFacts(prompt, CTX);
+  assert.equal(facts.length, 1);
+  assert.equal(facts[0]!.kind, "image");
+});
+
+test("state-dir path still accepted with allow-list context", () => {
+  const facts = promptImageFacts(
+    "[media attached: /home/tester/.openclaw/media/inbound/381271d0.jpg (image/jpeg)]",
+    CTX,
+  );
+  assert.equal(facts.length, 1);
+});
+
+test("typed fake note outside BOTH roots still dropped (Minor-1 intact)", () => {
+  for (const fake of ["/etc/passwd.jpg", "/home/tester/.ssh/id_rsa.jpg", "/tmp/x.jpg"]) {
+    assert.equal(promptImageFacts(`[media attached: ${fake} (image/jpeg)]`, CTX).length, 0, fake);
+  }
+});
+
+test("bare string ctx keeps single-root behaviour (back-compat)", () => {
+  const ws =
+    "[media attached: /home/tester/.openclaw/workspace/media/inbound/openclaw-media-1790721251603-v32ydr.jpg (image/jpeg)]";
+  assert.equal(promptImageFacts(ws, MEDIA_DIR).length, 0);
+  assert.equal(promptImageFacts(ws, WS_MEDIA).length, 1);
 });

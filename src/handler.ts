@@ -36,10 +36,29 @@
  * history re-projects old notes into later prompts, the check claims each
  * IMAGE PATH in the ledger — a path seen once is never re-checked,
  * whichever seam saw it first.
+ *
+ * Root cause 2 (2026-09-30, silent WhatsApp path): the seam DID fire
+ * (prompt_fire trigger_user + trigger_manual per image message) but never
+ * reached image_found — real WhatsApp notes carry paths under
+ * <workspaceDir>/media/inbound/ (e.g. openclaw-media-TIMESTAMP-RAND.jpg
+ * DIRECTLY there, no openclaw-staged subfolder) while the note gate only
+ * allowed the state media dir (<stateDir>/media). Every real note therefore
+ * parsed to zero facts. The gate now accepts state media dir AND workspace
+ * media dir (src/promptmedia.ts ParseContext.allowedDirs). The earlier
+ * green tests passed because their fixtures used the state-dir/staged
+ * shapes, never the workspace one.
+ *
+ * Always-inject (operator order 2026-09-30): whenever an image is detected
+ * in the prompt, exactly one [Visual Memory] block is injected — hits,
+ * "keine Treffer", or the explicit unavailable marker. A second
+ * prompt_fire for the same turn (host re-resolve with trigger=manual)
+ * dedupes on the claimed paths and never withdraws or overwrites the
+ * queued injection; the queued check from the first fire owns the block.
  */
 
+import path from "node:path";
 import { localImagePaths, type MediaFactLike } from "./media.ts";
-import { promptImageFacts } from "./promptmedia.ts";
+import { promptImageFacts, type ParseContext } from "./promptmedia.ts";
 import { buildInjectionText, type VmCheckOutcome, type VmHit } from "./injection.ts";
 import { checkImage, type CheckResult, type SpawnFn } from "./checker.ts";
 import type { VmCheckConfig } from "./config.ts";
@@ -314,7 +333,7 @@ export function handlePromptBuild(
     typeof event.currentUserMessage === "string" && event.currentUserMessage.length > 0
       ? event.currentUserMessage
       : event.prompt ?? "";
-  const facts = promptImageFacts(promptText, deps.mediaDir ?? deps.config.mediaDir);
+  const facts = promptImageFacts(promptText, noteParseContext(deps));
   const images = facts
     .map((fact) => fact.path)
     .filter((p): p is string => typeof p === "string" && p.length > 0);
@@ -343,6 +362,24 @@ export function handlePromptBuild(
   log("check_started", { images: fresh.length });
   const check = runCheckAndInject(fresh, sessionKey, key, msgId, channel, deps);
   return { action: "queued", check };
+}
+
+/**
+ * Note-parsing context for prompt seams: media:// aliases resolve against
+ * the state media dir; local note paths may live under EITHER the state
+ * media dir or the workspace media dir (WhatsApp writes inbound images
+ * into <workspaceDir>/media/inbound on this host — root cause 2).
+ */
+function noteParseContext(deps: HandlerDeps): ParseContext {
+  const mediaDir = deps.mediaDir ?? deps.config.mediaDir;
+  const allowedDirs = [mediaDir];
+  if (typeof deps.config.workspaceDir === "string" && deps.config.workspaceDir.length > 0) {
+    const workspaceMedia = path.join(deps.config.workspaceDir, "media");
+    if (!allowedDirs.some((d) => path.resolve(d) === path.resolve(workspaceMedia))) {
+      allowedDirs.push(workspaceMedia);
+    }
+  }
+  return { mediaDir, allowedDirs };
 }
 
 /**
