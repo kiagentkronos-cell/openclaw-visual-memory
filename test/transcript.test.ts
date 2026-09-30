@@ -94,13 +94,12 @@ test("transcript written per image run with hits (full reconstruction)", async (
     transcripts: cap.sink,
     mediaDir: dir,
   });
-  const decision = handlePromptBuild(
+  const decision = await handlePromptBuild(
     { prompt: `[media attached: ${img} (image/jpeg)]\nWer?` },
     { sessionKey: "agent:main:whatsapp:direct:+49x", channel: "whatsapp", trigger: "user" },
     deps,
   );
-  assert.equal(decision.action, "queued");
-  await (decision as { check: Promise<void> }).check;
+  assert.equal(decision.action, "prepend");
   assert.equal(cap.runs.length, 1);
   const { meta, lines } = cap.runs[0]!;
   assert.equal(meta.seam, "before_prompt_build");
@@ -121,7 +120,10 @@ test("transcript written per image run with hits (full reconstruction)", async (
   const inject = lines.find((l) => l.type === "inject");
   assert.ok(inject && String(inject.text).startsWith("[Visual Memory] Treffer: Alice"));
   const done = lines.find((l) => l.type === "done");
-  assert.ok(done && done.decision === "injected" && done.hitsTotal === 1);
+  // Synchronous same-turn delivery (operator order 30.09): the done line
+  // is written by the prompt seam itself as injected_sync.
+  assert.ok(done && done.decision === "injected_sync" && done.hitsTotal === 1);
+  assert.equal(inject!.mode, "same_turn");
 });
 
 test("transcript written for hits=[] run — keine-Treffer block recorded verbatim", async () => {
@@ -132,12 +134,11 @@ test("transcript written for hits=[] run — keine-Treffer block recorded verbat
     transcripts: cap.sink,
     mediaDir: dir,
   });
-  const decision = handlePromptBuild(
+  await handlePromptBuild(
     { prompt: `[media attached: ${img} (image/jpeg)]` },
     { sessionKey: "agent:main:whatsapp:direct:+49x", channel: "whatsapp", trigger: "user" },
     deps,
   );
-  await (decision as { check: Promise<void> }).check;
   assert.equal(cap.runs.length, 1);
   const check = cap.runs[0]!.lines.find((l) => l.type === "check");
   assert.deepEqual(check!.hits, []);
@@ -148,7 +149,7 @@ test("transcript written for hits=[] run — keine-Treffer block recorded verbat
 test("no image → no transcript opened", async () => {
   const cap = captureTranscripts();
   const deps = makeDeps({ spawn: spawnWith('{"ok":true,"hits":[]}'), transcripts: cap.sink });
-  handlePromptBuild(
+  await handlePromptBuild(
     { prompt: "nur text" },
     { sessionKey: "s", channel: "whatsapp", trigger: "user" },
     deps,
@@ -160,12 +161,11 @@ test("engine error run records check error + unavailable inject line", async () 
   const { dir, file: img } = await fakeMediaImage();
   const cap = captureTranscripts();
   const deps = makeDeps({ spawn: spawnWith("boom"), transcripts: cap.sink, mediaDir: dir });
-  const decision = handlePromptBuild(
+  await handlePromptBuild(
     { prompt: `[media attached: ${img} (image/jpeg)]` },
     { sessionKey: "s", channel: "whatsapp", trigger: "user" },
     deps,
   );
-  await (decision as { check: Promise<void> }).check;
   const check = cap.runs[0]!.lines.find((l) => l.type === "check");
   assert.equal(check!.status, "error");
   const inject = cap.runs[0]!.lines.find((l) => l.type === "inject");

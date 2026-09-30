@@ -12,6 +12,7 @@ import {
   handleMessageReceived,
   handlePromptBuild,
   MessageLedger,
+  type HandlerDecision,
   type HandlerDeps,
 } from "./handler.ts";
 import type { SpawnFn } from "./checker.ts";
@@ -39,8 +40,14 @@ export interface ApiLike {
   };
   on: (
     hook: "message_received" | "before_prompt_build",
-    handler: (event: any, ctx: any) => Promise<void> | void,
+    handler: (event: any, ctx: any) => Promise<void | PromptPrepend> | void,
+    opts?: { timeoutMs?: number },
   ) => void;
+}
+
+//** before_prompt_build modifier result (host: runModifyingHook). */
+export interface PromptPrepend {
+  prependContext?: string;
 }
 
 export interface EntryDeps {
@@ -95,59 +102,77 @@ export function buildDeps(api: ApiLike, config: VmCheckConfig, extras: EntryDeps
   };
 }
 
+/** Extra await budget the host grants on top of checkTimeoutMs so the
+ * synchronous check can finish its cleanup before the host's own timeout
+ * fires (active-memory arms its deadline the same way: MAX + grace). */
+export const HOOK_GRACE_MS = 5_000;
+
 /**
  * Register the hooks on a plugin api:
- * - message_received: the typed inbound-message seam (webchat and channels
- *   that broadcast it), and
- * - before_prompt_build: the channel-agnostic agent-turn seam. The WhatsApp
- *   channel plugin privacy-suppresses message_received unless the operator
- *   opts in (channels.whatsapp.pluginHooks.messageReceived), so prompt
- *   notes are the reliable path there (docs/channels/whatsapp.md). Path
- *   claiming in the ledger keeps the two seams from double-checking one
- *   image.
+ * - before_prompt_build (the delivery seam): awaits the vm.py check
+ *   SYNCHRONOUSLY and returns { prependContext } for the SAME prompt —
+ *   the Gateway waits, exactly like it waits for Active Memory (operator
+ *   order 30.09). Registration carries { timeoutMs: checkTimeoutMs +
+ *   grace } (docs/plugins/hooks/reference.md) so the host's await budget
+ *   covers the full check window. Fires on every channel, including
+ *   WhatsApp where message_received is privacy-suppressed (docs/channels/
+ *   whatsapp.md).
+ * - message_received: observation seam only (image_found logging + the
+ *   single staging-pending retry). Checks are NOT run here; the prompt
+ *   seam of the same turn owns every image.
  * Returns bound handlers for test observability.
  */
 export function registerMessageHook(api: ApiLike, extras: EntryDeps = {}): {
   config: VmCheckConfig;
-  handle: (event: unknown, ctx: unknown) => void;
-  handlePrompt: (event: unknown, ctx: unknown) => void;
+  handle: (event: unknown, ctx: unknown) => HandlerDecision;
+  handlePrompt: (event: unknown, ctx: unknown) => Promise<HandlerDecision>;
+  /** Registered hook handlers (tests drive these like the host would). */
+  handlers: Partial<
+    Record<"message_received" | "before_prompt_build", (event: any, ctx: any) => Promise<unknown>>
+  >;
 } {
   const config = normalizeConfig(api.pluginConfig);
   const deps = buildDeps(api, config, extras);
-  const handle = (event: unknown, ctx: unknown) => {
-    const decision = handleMessageReceived(
+  const handle = (event: unknown, ctx: unknown): HandlerDecision =>
+    handleMessageReceived(
       event as Parameters<typeof handleMessageReceived>[0],
       ctx as { sessionKey?: string; messageId?: string },
       deps,
     );
-    if (decision.action === "queued") {
-      // Fire-and-forget: completion injects; failures are logged inside.
-      void decision.check.catch((err: unknown) => {
-        api.logger.error?.(`visual-memory: detached check crashed (${String(err)})`);
-      });
-    }
-  };
-  api.on("message_received", async (event, ctx) => {
-    handle(event, ctx);
-  });
-  const handlePrompt = (event: unknown, ctx: unknown) => {
-    const decision = handlePromptBuild(
+  const handlePrompt = (event: unknown, ctx: unknown): Promise<HandlerDecision> =>
+    handlePromptBuild(
       event as Parameters<typeof handlePromptBuild>[0],
       ctx as Parameters<typeof handlePromptBuild>[1],
       deps,
     );
-    if (decision.action === "queued") {
-      void decision.check.catch((err: unknown) => {
-        api.logger.error?.(`visual-memory: detached prompt check crashed (${String(err)})`);
-      });
-    }
+  const handlers: Record<string, (event: any, ctx: any) => Promise<unknown>> = {
+    before_prompt_build: async (event, ctx) => {
+      const decision = await handlePrompt(event, ctx);
+      // Same-turn synchronous delivery (operator order 30.09 10:17).
+      if (decision.action === "prepend") {
+        return { prependContext: decision.text };
+      }
+      return undefined;
+    },
+    message_received: async (event, ctx) => {
+      handle(event, ctx);
+      return undefined;
+    },
   };
-  api.on("before_prompt_build", async (event, ctx) => {
-    // Non-mutating: returning undefined leaves the prompt untouched; the
-    // check itself stays detached (result goes to next-turn injection).
-    handlePrompt(event, ctx);
+  api.on("message_received", async (event, ctx) => {
+    await handlers.message_received!(event, ctx);
   });
-  return { config, handle, handlePrompt };
+  api.on(
+    "before_prompt_build",
+    async (event, ctx) => {
+      const r = await handlers.before_prompt_build!(event, ctx);
+      return (r as PromptPrepend | undefined) ?? undefined;
+    },
+    // The Gateway must wait for the full synchronous check window
+    // (active-memory analogue; operators may still override per plugin).
+    { timeoutMs: config.checkTimeoutMs + HOOK_GRACE_MS },
+  );
+  return { config, handle, handlePrompt, handlers };
 }
 
 // Referenced so test overrides can disable the file sink explicitly.

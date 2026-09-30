@@ -1,9 +1,11 @@
 {
   "id": "visual-memory",
   "name": "Visual Memory",
-  "description": "Checks every inbound image against the local Visual Memory register (vm.py) and provides the result to the agent as next-turn context.",
+  "description": "Checks every inbound image against the local Visual Memory register (vm.py) and injects the result synchronously into the same prompt turn (Gateway waits, active-memory parity).",
   "version": "0.1.0",
-  "categories": ["other"],
+  "categories": [
+    "other"
+  ],
   "activation": {
     "onStartup": true
   },
@@ -34,8 +36,8 @@
         "type": "integer",
         "minimum": 1000,
         "maximum": 120000,
-        "default": 30000,
-        "description": "Hard timeout for one vm.py check run; on timeout nothing is injected."
+        "default": 120000,
+        "description": "Hard total timeout for the synchronous check chain; the Gateway waits up to this long during before_prompt_build (operator order 30.09: 2 minutes, active-memory parity). On expiry the turn gets the explicit 'not available (timeout)' marker."
       },
       "maxImageSizeBytes": {
         "type": "integer",
@@ -53,7 +55,7 @@
         "type": "integer",
         "minimum": 5000,
         "default": 120000,
-        "description": "Next-turn injection TTL: results that arrive after this window are dropped instead of injected into an unrelated turn."
+        "description": "TTL of the next-turn injection used ONLY by the staging-retry fallback; late results expire instead of landing in an unrelated turn."
       },
       "stagingRetryMs": {
         "type": "integer",

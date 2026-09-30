@@ -1,59 +1,38 @@
 /**
- * message_received handler logic (framework-free core).
+ * Handler logic for the visual-memory hook (framework-free core).
  *
- * Behaviour contract (docs/plugins/hooks/messages.md) + host reality check
- * (dispatch-from-config, verified 2026-09-29):
- * - Image facts arrive typed via event.media[] (path/kind/contentType).
- * - The docs say that when mediaStagingPending is true, event.media is
- *   withheld and "a later staged event" delivers the readable paths. Host
- *   reality: message_received is emitted EXACTLY ONCE per accepted inbound
- *   turn (emitMessageReceivedHooks in dispatch-from-config) — waiting for a
- *   second event therefore never fires. The flag is also gated on
- *   ctx.MediaRemoteHost, so locally-saved channel media (WhatsApp
- *   media/inbound) never even sets it. Both shapes are handled here:
- *   media[] present -> normal path; media withheld for any reason -> ONE
- *   delayed, existence-guarded retry over originalMedia (a path that is
- *   already readable locally proceeds to the check; a true remote path
- *   gives up quietly after exactly one attempt). Whatever runs the check
- *   claims the messageId in the ledger, so a hypothetical real staged
- *   event still dedupes against it.
- * - The GPU check may take seconds: the handler itself must never await it
- *   into the message flow beyond the hook budget. The caller decides how to
- *   run it (fire-and-forget with completion -> next-turn injection).
- * - Every decision appends exactly one PII-free line to the diagnostic sink
- *   (see diaglog.ts) so silent failures (host-side enqueue refusals,
- *   missing events) are greppable after the fact.
+ * Delivery contract (operator order 2026-09-30 10:17, binding):
+ * the Gateway WAITS for this plugin during before_prompt_build, exactly
+ * like it waits for Active Memory ("Active Memory darf bis zu 2 Minuten
+ * dauern. Das Gateway wartet auf Fertigstellung."). The prompt seam
+ * therefore AWAITS the vm.py check synchronously and returns the
+ * [Visual Memory] block as prependContext IN THE SAME PROMPT. Total time
+ * budget: config.checkTimeoutMs (default 120000 — active-memory's
+ * MAX_TIMEOUT_MS is 120000 as well); each per-image run gets the REMAINING
+ * budget and the whole chain is hard-capped, so the hook always returns a
+ * block (hits / keine Treffer / explicit timeout marker) — never an
+ * eternal wait. Registration passes { timeoutMs } with the same budget
+ * (docs/plugins/hooks/reference.md: api.on opts timeoutMs; operators may
+ * override per plugin up to 600000).
  *
- * Second seam (WhatsApp root cause, 2026-09-29): the WhatsApp channel plugin
- * does NOT emit `message_received` for plugin hooks unless the operator
- * opts in via channels.whatsapp.pluginHooks.messageReceived (docs/channels/
- * whatsapp.md "Plugin hooks and privacy"; monitor: suppressMessageReceived
- * Hooks = true by default). Webchat proved the handler itself works; on
- * WhatsApp it was never invoked. The fix adds handlePromptBuild on
- * `before_prompt_build`, the channel-agnostic agent-turn hook that fires
- * for EVERY admitted turn. Inbound image paths arrive there as
- * `[media attached: ...]` prompt notes (src/promptmedia.ts). Because
- * history re-projects old notes into later prompts, the check claims each
- * IMAGE PATH in the ledger — a path seen once is never re-checked,
- * whichever seam saw it first.
- *
- * Root cause 2 (2026-09-30, silent WhatsApp path): the seam DID fire
- * (prompt_fire trigger_user + trigger_manual per image message) but never
- * reached image_found — real WhatsApp notes carry paths under
- * <workspaceDir>/media/inbound/ (e.g. openclaw-media-TIMESTAMP-RAND.jpg
- * DIRECTLY there, no openclaw-staged subfolder) while the note gate only
- * allowed the state media dir (<stateDir>/media). Every real note therefore
- * parsed to zero facts. The gate now accepts state media dir AND workspace
- * media dir (src/promptmedia.ts ParseContext.allowedDirs). The earlier
- * green tests passed because their fixtures used the state-dir/staged
- * shapes, never the workspace one.
- *
- * Always-inject (operator order 2026-09-30): whenever an image is detected
- * in the prompt, exactly one [Visual Memory] block is injected — hits,
- * "keine Treffer", or the explicit unavailable marker. A second
- * prompt_fire for the same turn (host re-resolve with trigger=manual)
- * dedupes on the claimed paths and never withdraws or overwrites the
- * queued injection; the queued check from the first fire owns the block.
+ * Seam ownership:
+ * - before_prompt_build is the ONLY seam that runs checks. It fires for
+ *   every admitted user turn on every channel (WhatsApp privacy-suppresses
+ *   message_received for plugins unless opted in — docs/channels/
+ *   whatsapp.md — and history re-projects old `[media attached: ...]`
+ *   notes, so every candidate path is claimed in the ledger before
+ *   checking: a path seen once is never re-checked.
+ * - message_received only OBSERVES (logs image_found) and handles the
+ *   staging-pending edge: media withheld -> ONE delayed, existence-
+ *   guarded retry over originalMedia (the host emits message_received
+ *   exactly once per turn — waiting for a second event never fires;
+ *   dispatch-from-config, verified 2026-09-29). That retry lands AFTER
+ *   the current prompt was built, so it is the only user of the next-turn
+ *   enqueue. If the host refuses that enqueue ({ enqueued: false } without
+ *   throwing — root cause 3), the line logs inject_failed; this
+ *   best-effort fallback may drop, the synchronous path may not.
+ * - Every decision appends exactly one PII-free line to the diagnostic
+ *   sink (see diaglog.ts) so silent failures are greppable after the fact.
  */
 
 import path from "node:path";
@@ -126,11 +105,14 @@ function channelLabel(event: ReceivedEventLike): string | undefined {
 }
 
 /** Enqueue result surface: the host returns { enqueued: boolean }; a false
- * result means the injection was refused WITHOUT throwing (e.g. session
- * entry not found). Treat it as a visible inject_failed, never as success. */
+ * result means the injection was refused WITHOUT throwing. Only the
+ * staging-retry fallback still uses enqueue (best effort). */
 export interface EnqueueResultLike {
   enqueued?: unknown;
 }
+
+/** Where a finished block went (staging-retry fallback only). */
+export type DeliveryOutcome = "enqueued" | "dropped";
 
 export interface HandlerDeps {
   config: VmCheckConfig;
@@ -139,7 +121,8 @@ export interface HandlerDeps {
   scriptPath: string;
   spawn?: SpawnFn;
   now?: () => number;
-  /** Enqueue text for the next turn of this session (host API in production). */
+  /** Next-turn enqueue — ONLY the staging-retry fallback uses this now;
+   * the prompt seam delivers synchronously via prependContext. */
   enqueue: (params: {
     sessionKey: string;
     text: string;
@@ -171,9 +154,9 @@ export interface HandlerDeps {
 
 /**
  * Short-lived ledger of message keys AND image paths already handled
- * (bounded). Path claims make the two seams (message_received /
- * before_prompt_build) idempotent against each other and stop prompt-note
- * re-projection from retriggering checks on old attachments.
+ * (bounded). Path claims stop prompt-note re-projection (and the host's
+ * same-turn re-resolve with trigger=manual) from retriggering checks on
+ * attachments already seen.
  */
 export class MessageLedger {
   private readonly seen = new Map<string, number>();
@@ -214,18 +197,29 @@ export class MessageLedger {
   }
 }
 
+/** Result once the vm.py checks are done, ready for same-turn delivery. */
+export interface CheckDone {
+  text: string;
+  hitsTotal: number;
+  run: TranscriptRun;
+  startedAt: number;
+}
+
 /** What the handler decided, for observability and tests. */
 export type HandlerDecision =
   | { action: "disabled" }
   | { action: "no-image"; reason?: "no_session" }
   | { action: "staging-pending" }
   | { action: "duplicate" }
-  | { action: "queued"; check: Promise<void> };
+  /** message_received saw image facts; the prompt seam owns the check. */
+  | { action: "image-noted" }
+  /** Synchronous same-turn delivery: prepend text to THIS prompt. */
+  | { action: "prepend"; text: string };
 
 /**
- * Handle one message_received event. Returns synchronously with a decision;
- * the (slow) check runs detached in `check` and injects its result through
- * deps.enqueue when it completes. Never throws.
+ * Handle one message_received event. Observes image facts (the check runs
+ * in the prompt seam of the same turn) and schedules the single guarded
+ * staging retry when media was withheld. Never throws, never awaits I/O.
  */
 export function handleMessageReceived(
   event: ReceivedEventLike,
@@ -243,13 +237,12 @@ export function handleMessageReceived(
     return { action: "disabled" };
   }
 
-  // Staging not finished: media[] is withheld by design. The docs promise a
-  // later staged event, but the host emits message_received only once per
-  // accepted turn (emitMessageReceivedHooks; no second emission exists for
-  // the staged revision) — so waiting never fires. Schedule ONE guarded
-  // retry instead. The retry claims the key only after its existence probe
-  // finds readable files, so a genuine staged event (should the host ever
-  // emit one) still owns the check and the retry dedupes against it.
+  // Staging not finished: media[] is withheld by design. The host emits
+  // message_received only once per accepted turn (emitMessageReceivedHooks;
+  // no second emission exists for the staged revision) — so waiting for a
+  // "later staged event" never fires. Schedule ONE guarded retry instead;
+  // its files land after the current prompt was built, so that retry is
+  // the sole remaining user of the next-turn enqueue.
   if (event.mediaStagingPending === true && !Array.isArray(event.media)) {
     log("staging_pending_skip", {
       images: Array.isArray(event.originalMedia) ? event.originalMedia.length : 0,
@@ -270,54 +263,40 @@ export function handleMessageReceived(
     return { action: "no-image" };
   }
 
-  const sessionKey = resolveSessionKey(event, ctx);
-  if (!sessionKey) {
-    // Without a session there is no next turn to inject into. Hardening
-    // (Hyperion review 1c4c01d, Minor-2): this check runs BEFORE any ledger
-    // claim — claiming message key/paths without a session would mark the
-    // images handled while nothing was ever checked, silently disarming the
-    // prompt-build seam for the same files.
-    deps.log.warn("visual-memory: image message without resolvable sessionKey; skipped");
-    log("no_image", { reason: "no_session" });
-    return { action: "no-image", reason: "no_session" };
-  }
-
-  if (!deps.processed.claim(key)) {
-    log("dedup_skip");
-    return { action: "duplicate" };
-  }
-  // Claim the paths too: the prompt-build seam must not re-check them.
-  for (const image of images) deps.processed.claimPath(image);
+  // Observation only: the before_prompt_build seam of the SAME turn claims
+  // these paths and delivers synchronously. Checking here as well would
+  // double GPU work or race the synchronous delivery.
   log("image_found", { images: images.length });
-
-  log("check_started", { images: images.length });
-  const check = runCheckAndInject(images, sessionKey, key, msgId, channel, deps);
-  return { action: "queued", check };
+  return { action: "image-noted" };
 }
 
 /**
- * Handle one before_prompt_build event (the channel-agnostic seam that also
- * fires on WhatsApp, where message_received is privacy-suppressed by the
- * channel plugin). Images arrive there as `[media attached: ...]` notes in
- * the prompt. Decisions:
+ * Handle one before_prompt_build event SYNCHRONOUSLY (the operator's
+ * 30.09. order: the Gateway waits for the check like it waits for Active
+ * Memory). Images arrive as `[media attached: ...]` notes in the prompt.
+ * Decisions:
  * - always ONE `prompt_fire` diag line (fire+decision, even when no image —
  *   greppable trigger evidence on every channel),
  * - only user-trigger runs get checked (when the host provides the field):
  *   cron/heartbeat turns carry re-projected history notes, not fresh
  *   attachments,
- * - every candidate path is claimed in the ledger first; a path the
- *   message_received seam already checked (or a re-projected old note)
- *   dedupes to a duplicate decision, never a second vm.py run.
- * Never throws.
+ * - every candidate path is claimed in the ledger first; a path already
+ *   checked (re-projected old note, same-turn re-fire) dedupes to
+ *   `duplicate`, never a second vm.py run,
+ * - the check chain is hard-capped at config.checkTimeoutMs (remaining
+ *   budget per image); on expiry the block says Check nicht verfügbar
+ *   (timeout) instead of waiting further.
+ * Resolves with { action: "prepend"; text } when this turn owns a check.
+ * Never rejects.
  */
-export function handlePromptBuild(
+export async function handlePromptBuild(
   event: PromptBuildEventLike,
   ctx: PromptBuildContextLike,
   deps: HandlerDeps,
-): HandlerDecision {
+): Promise<HandlerDecision> {
   const channel = ctx.channel ?? ctx.channelId;
   const msgId = "promptbuild";
-  const log = (decision: DiagKind, extra?: { reason?: string; images?: number }) =>
+  const log = (decision: DiagKind, extra?: { reason?: string; images?: number; hits?: number }) =>
     deps.diag.record({ msgId, channel, decision, ...extra });
 
   if (!deps.config.enabled) {
@@ -353,7 +332,7 @@ export function handlePromptBuild(
     return { action: "no-image", reason: "no_session" };
   }
 
-  // Claim paths; keep only the ones this invocation newly claimed.
+  // Claim paths; deliver only when this invocation newly claimed them.
   const fresh = images.filter((p) => deps.processed.claimPath(p));
   if (fresh.length === 0) {
     log("dedup_skip", { images: images.length });
@@ -365,11 +344,28 @@ export function handlePromptBuild(
   const key = `path:${fresh.join(",")}`;
   log("image_found", { images: fresh.length });
   log("check_started", { images: fresh.length });
-  const check = runCheckAndInject(fresh, sessionKey, key, msgId, channel, deps, {
+
+  const result = await runChecks(fresh, sessionKey, key, msgId, channel, deps, {
     seam: "before_prompt_build",
     trigger: ctx.trigger,
   });
-  return { action: "queued", check };
+  const { text, hitsTotal, run, startedAt } = result;
+
+  // Same-turn delivery: the caller returns `text` as prependContext. The
+  // transcript records the injection exactly once, here.
+  run.record({
+    type: "inject",
+    text,
+    idempotencyKey: `visual-memory:${sessionKey}:${key}`,
+    mode: "same_turn",
+  });
+  run.done({
+    decision: "injected_sync",
+    hitsTotal,
+    durationMs: (deps.now ?? Date.now)() - startedAt,
+  });
+  log("injected", { hits: hitsTotal, reason: "same_turn" });
+  return { action: "prepend", text };
 }
 
 /**
@@ -380,6 +376,13 @@ export function handlePromptBuild(
  */
 function noteParseContext(deps: HandlerDeps): ParseContext {
   const mediaDir = deps.mediaDir ?? deps.config.mediaDir;
+  allowedMediaDirs(deps).length; // keep helper usage explicit for readers
+  const allowedDirs = allowedMediaDirs(deps);
+  return { mediaDir, allowedDirs };
+}
+
+function allowedMediaDirs(deps: HandlerDeps): string[] {
+  const mediaDir = deps.mediaDir ?? deps.config.mediaDir;
   const allowedDirs = [mediaDir];
   if (typeof deps.config.workspaceDir === "string" && deps.config.workspaceDir.length > 0) {
     const workspaceMedia = path.join(deps.config.workspaceDir, "media");
@@ -387,7 +390,7 @@ function noteParseContext(deps: HandlerDeps): ParseContext {
       allowedDirs.push(workspaceMedia);
     }
   }
-  return { mediaDir, allowedDirs };
+  return allowedDirs;
 }
 
 /**
@@ -396,7 +399,10 @@ function noteParseContext(deps: HandlerDeps): ParseContext {
  * channel already wrote the file locally (WhatsApp media/inbound), the path
  * is readable at retry time and the check proceeds; if it is a true remote
  * path, the probe fails and we give up after exactly one attempt (documented
- * impossibility, no second event exists). Never logs the path itself.
+ * impossibility, no second event exists). This is the ONLY remaining user
+ * of the next-turn enqueue (the files missed the current prompt); a host
+ * refusal there logs inject_failed and drops (best effort).
+ * Never logs the path itself.
  */
 function retryStagedOriginals(
   originals: MediaFactLike[],
@@ -425,19 +431,80 @@ function retryStagedOriginals(
     log("staging_pending_skip", { reason: "retry_not_readable" });
     return;
   }
-  // A real staged event may have claimed the key in the meantime.
-  if (!deps.processed.claim(key)) {
+  // A prompt-seam run may have claimed the paths in the meantime (staged
+  // note already in the prompt): then the synchronous delivery owns it.
+  const fresh = images.filter((p) => deps.processed.claimPath(p));
+  if (fresh.length === 0) {
     log("dedup_skip");
     return;
   }
-  log("check_started", { images: images.length });
-  void runCheckAndInject(images, sessionKey, key, msgId, channel, deps).catch(() => {
+  log("check_started", { images: fresh.length });
+  void deliverViaNextTurn(fresh, sessionKey, key, msgId, channel, deps, {
+    seam: "staging_retry",
+  }).catch(() => {
     /* logged inside */
   });
 }
 
-/** Run every image check (sequentially - GPU friendly) and inject once. */
-async function runCheckAndInject(
+/**
+ * Staging-retry only: run the checks, then enqueue for the NEXT turn
+ * (this seam cannot modify any prompt). Enqueue refusals (host_refused)
+ * and throws log inject_failed and drop the block — this fallback is best
+ * effort by design; the synchronous prompt path never uses enqueue.
+ */
+async function deliverViaNextTurn(
+  images: string[],
+  sessionKey: string,
+  key: string,
+  msgId: string,
+  channel: string | undefined,
+  deps: HandlerDeps,
+  transcriptMeta?: Record<string, unknown>,
+): Promise<DeliveryOutcome> {
+  const log = (decision: DiagKind, extra?: { reason?: string; hits?: number }) =>
+    deps.diag.record({ msgId, channel, decision, ...extra });
+  const result = await runChecks(images, sessionKey, key, msgId, channel, deps, transcriptMeta);
+  const { text, hitsTotal, run, startedAt } = result;
+  const elapsed = () => (deps.now ?? Date.now)() - startedAt;
+  const idempotencyKey = `visual-memory:${sessionKey}:${key}`;
+  run.record({ type: "inject", text, idempotencyKey, mode: "next_turn", ttlMs: deps.config.injectionTtlMs });
+  try {
+    const res = await deps.enqueue({
+      sessionKey,
+      text,
+      // One injection per message+session: covers re-delivery of the same
+      // message and lets the host dedupe pending entries.
+      idempotencyKey,
+      ttlMs: deps.config.injectionTtlMs,
+    });
+    // The host refuses WITHOUT throwing ({ enqueued: false }): policy
+    // grant, lifecycle authority, bad params, unresolvable session entry,
+    // duplicate key, 32/session cap (dist host map, 30.09). Best effort ->
+    // log and drop.
+    if (res && typeof res === "object" && res.enqueued === false) {
+      log("inject_failed", { reason: "host_refused" });
+      deps.log.error("visual-memory: staging-retry enqueue refused by host (enqueued=false)");
+      run.done({ decision: "inject_failed", reason: "host_refused", hitsTotal, durationMs: elapsed() });
+      return "dropped";
+    }
+    log("injected", { hits: hitsTotal, reason: "next_turn" });
+    run.done({ decision: "injected", hitsTotal, durationMs: elapsed() });
+    return "enqueued";
+  } catch (err) {
+    log("inject_failed", { reason: reasonToken(String(err)) });
+    deps.log.error(`visual-memory: staging-retry enqueue failed (${String(err)})`);
+    run.done({ decision: "inject_failed", reason: reasonToken(String(err)), hitsTotal, durationMs: elapsed() });
+    return "dropped";
+  }
+}
+
+/** Run every image check (sequentially - GPU friendly) under a HARD total
+ * deadline: the whole chain must resolve within config.checkTimeoutMs so
+ * the synchronous hook always returns a block. Each run gets the REMAINING
+ * budget; once the deadline passes, the rest resolve as timeout errors
+ * without spawning. Delivery is the caller's job (same-turn prepend or,
+ * for the staging retry, next-turn enqueue). */
+async function runChecks(
   images: string[],
   sessionKey: string,
   messageKeyStr: string,
@@ -445,7 +512,7 @@ async function runCheckAndInject(
   channel: string | undefined,
   deps: HandlerDeps,
   transcriptMeta?: Record<string, unknown>,
-): Promise<void> {
+): Promise<CheckDone> {
   const log = (decision: DiagKind, extra?: { reason?: string; hits?: number }) =>
     deps.diag.record({ msgId, channel, decision, ...extra });
 
@@ -459,6 +526,7 @@ async function runCheckAndInject(
     ...transcriptMeta,
   });
   const startedAt = (deps.now ?? Date.now)();
+  const deadlineAt = startedAt + deps.config.checkTimeoutMs;
 
   // Image identity lines: path + content-free hash + stat only, never bytes.
   for (const image of images) {
@@ -482,10 +550,17 @@ async function runCheckAndInject(
   const outcomes: CheckResult[] = [];
   for (const image of images) {
     const checkStarted = (deps.now ?? Date.now)();
+    const remaining = deadlineAt - checkStarted;
+    if (remaining <= 0) {
+      // Total budget exhausted before this image: honest timeout, no spawn.
+      outcomes.push({ status: "error", reason: "check timed out" });
+      run.record({ type: "check", path: image, status: "error", reason: "deadline exhausted", durationMs: 0 });
+      continue;
+    }
     const result = await checkImage(image, {
       pythonPath: deps.pythonPath,
       scriptPath: deps.scriptPath,
-      timeoutMs: deps.config.checkTimeoutMs,
+      timeoutMs: remaining,
       maxSizeBytes: deps.config.maxImageSizeBytes,
       maxAgeMs: deps.config.maxImageAgeMs,
       spawn: deps.spawn,
@@ -556,39 +631,8 @@ async function runCheckAndInject(
     outcome = { status: "ok", hits: [...best.values()] };
   }
   const text = buildInjectionText(outcome);
-  const idempotencyKey = `visual-memory:${sessionKey}:${messageKeyStr}`;
-  run.record({ type: "inject", text, idempotencyKey, ttlMs: deps.config.injectionTtlMs });
-  try {
-    const result = await deps.enqueue({
-      sessionKey,
-      text,
-      // One injection per message+session: covers re-delivery of the same
-      // message and lets the host dedupe pending entries.
-      idempotencyKey,
-      ttlMs: deps.config.injectionTtlMs,
-    });
-    // The host refuses WITHOUT throwing ({ enqueued: false }) when the
-    // session entry is missing or policy blocks it — surface that here or
-    // the failure stays invisible (root cause of the silent 29.09 incident).
-    if (result && typeof result === "object" && result.enqueued === false) {
-      log("inject_failed", { reason: "host_refused" });
-      deps.log.error("visual-memory: enqueue refused by host (enqueued=false)");
-      run.done({ decision: "inject_failed", reason: "host_refused", durationMs: (deps.now ?? Date.now)() - startedAt });
-      return;
-    }
-    log("injected", {
-      hits: outcome.status === "ok" ? outcome.hits.length : 0,
-    });
-    run.done({
-      decision: "injected",
-      hitsTotal: outcome.status === "ok" ? outcome.hits.length : 0,
-      durationMs: (deps.now ?? Date.now)() - startedAt,
-    });
-  } catch (err) {
-    log("inject_failed", { reason: reasonToken(String(err)) });
-    deps.log.error(`visual-memory: enqueue failed (${String(err)})`);
-    run.done({ decision: "inject_failed", reason: reasonToken(String(err)), durationMs: (deps.now ?? Date.now)() - startedAt });
-  }
+  const hitsTotal = outcome.status === "ok" ? outcome.hits.length : 0;
+  return { text, hitsTotal, run, startedAt };
 }
 
 /** Map a free-form error reason to a compact greppable token. */

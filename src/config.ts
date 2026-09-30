@@ -15,7 +15,11 @@ export interface VmCheckConfig {
   vmScriptRelPath: string;
   /** Python interpreter relative to workspaceDir. */
   venvRelPath: string;
-  /** Hard timeout for one vm.py check invocation. */
+  /** Hard timeout for one vm.py check invocation — also the total budget the
+   * Gateway waits for this plugin in before_prompt_build (operator order
+   * 30.09: "Active Memory darf bis zu 2 Minuten dauern — so soll es bei
+   * visual Memory auch sein"). Active-memory analogue: MAX_TIMEOUT_MS there
+   * is 120000. */
   checkTimeoutMs: number;
   /** Skip images larger than this (bytes). */
   maxImageSizeBytes: number;
@@ -64,7 +68,7 @@ export const DEFAULT_CONFIG: VmCheckConfig = {
   workspaceDir: defaultWorkspaceDir(),
   vmScriptRelPath: "scripts/visual-memory/vm.py",
   venvRelPath: "scripts/visual-memory/venv/bin/python",
-  checkTimeoutMs: 30_000,
+  checkTimeoutMs: 120_000,
   maxImageSizeBytes: 20 * 1024 * 1024,
   maxImageAgeMs: 15 * 60 * 1000,
   injectionTtlMs: 120_000,
