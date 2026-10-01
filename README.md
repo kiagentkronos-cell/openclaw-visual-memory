@@ -20,7 +20,8 @@ sensitive data and keep it on trusted hardware.
 ## Requirements
 
 - OpenClaw host `>= 2026.9.6` (typed plugin hooks, `api.session.workflow`).
-- Node 24+ (TypeScript sources are loaded directly via `openclaw.extensions`).
+- Node 24+. The published package ships a compiled bundle (`dist/index.js`);
+  TypeScript sources are in `src/` and are rebuilt with esbuild for release.
 - A working Visual Memory tool repository (`vm.py` + Python venv, InsightFace
   and CLIP installed) reachable under `workspaceDir` (default
   `~/.openclaw/workspace` of the Gateway host user, tool at
@@ -126,10 +127,16 @@ default, never an error; partial configs deep-merge):
 
 ```json
 {
-  "paths":       { "register": "register.db", "references": "references", "…": "…" },
-  "thresholds":  { "person": 0.40, "animal": 0.85, "vehicle": 0.60, "building": 0.60, "object": 0.60 },
-  "dreaming":    { "window_days": 3, "candidates_max": 5, "miss_budget": 3 },
-  "engine":      { "backend": "local", "cloud": { "allow_faces": false } }
+  "paths": {
+    "register": "register.db",
+    "references": "references",
+    "register_public": "register_public.db",
+    "references_public": "references_public",
+    "dreaming_registry": "dreamed-themes.json"
+  },
+  "thresholds": { "person": 0.40, "animal": 0.85, "vehicle": 0.60, "building": 0.60, "object": 0.60 },
+  "dreaming":   { "window_days": 3, "candidates_max": 5, "miss_budget": 3 },
+  "engine":     { "backend": "local", "cloud": { "allow_faces": false } }
 }
 ```
 
@@ -170,22 +177,32 @@ Every decision is greppable, and PII-free (path hashes, no message content):
 | `Check nicht verfügbar (timeout)` | CLI slower than `checkTimeoutMs` | Raise the budget or check resource contention. |
 | Image silently skipped | `maxImageAgeMs` replay guard on re-delivered media | Raise the age limit if legitimate. |
 
+## Privacy model
+
+- **Local by default.** Inference, register, and reference crops stay on the
+  host machine; the plugin itself makes no network calls and sends no telemetry.
+- **The register is sensitive data.** Face embeddings and reference crops of
+  real people live only in the CLI's SQLite databases on the host. The plugin
+  passes image paths to the CLI and receives names + scores back; it never
+  copies biometric data into logs, transcripts, or prompts.
+- **Explicit enrollment only.** Nothing is enrolled automatically; enrolling a
+  third party requires their consent. Deleting the CLI's database files erases
+  everything.
+- **Third-party use:** deploying this beyond your own machine is the operator's
+  responsibility — disclosure obligations (who's recorded, where data goes) are
+  the operator's to fulfil, and the biometric-off-machine defaults above are
+  deliberate guardrails, not features to quietly flip.
+
 ## Development
 
 ```bash
 bash scripts/validate-offline.sh   # typecheck + tests + manifest load
+npm run build                      # rebuild dist/index.js (esbuild) for release
 ```
 
 Tests need no GPU; they run against fixture media in a Node test runner
-(93 tests as of 2026-09-30).
-
-## Documentation
-
-Full (German) documentation with architecture rationale, thresholds, commit
-history, and release conditions: [`docs/DOKUMENTATION.md`](docs/DOKUMENTATION.md).
-Design decisions: ADR-0001 (local engine), ADR-0002 (reference crops),
-ADR-0003 (config + swappable engine backend for third-party use) in the tool
-repository.
+(93 tests). The release bundle in `dist/` is built from `src/` with esbuild
+and must be current with it (CI check: rebuild + diff).
 
 ## License
 
