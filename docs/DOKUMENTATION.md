@@ -214,7 +214,8 @@ Belegte Live-Fälle 29.–30.09.: (a) WhatsApp feuerte `message_received` nie �
 ## 7. Stand & Historie
 
 - Stand 30.09.: **einsatzbereit**, 93/93 Tests grün, Typecheck + Offline-
-  Validierung grün, Stand `05c220c` (+ Doku/README/LICENSE im Folge-Commit).
+  Validierung grün, Stand `49862a1` (= Release 1.0.0; Vorläufer-Commits
+  `05c220c` → `ecb77f6` → `83ac2ad` mit Doku/README/LICENSE/dist-Bundle).
 - End-to-end verifiziert: Person (0,81 certain) und Tier (0,93 possible),
   synchrone Injektion im selben Turn, Protokoll nachweisbar.
 - **Push in ein öffentliches Repo ist noch NICHT erfolgt** (Freigabe-
