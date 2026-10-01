@@ -8,11 +8,12 @@ agent having to remember to run it.
 
 This plugin contains **no register logic**. It is a thin hook wrapper around
 the Visual Memory CLI (`vm.py`), which owns faces, embeddings, thresholds, and
-the SQLite register. The plugin only: classifies typed media facts, shells out
-to the CLI with a hard timeout, formats the result, and returns it as
-same-turn prompt context.
+the SQLite register — including its own optional `config.json` (see below).
+The plugin only: classifies typed media facts, shells out to the CLI with a
+hard timeout, formats the result, and returns it as same-turn prompt context.
 
-**All processing stays local.** No cloud calls, no telemetry. The register may
+**All processing stays local** with the default configuration. No cloud calls,
+no telemetry. The register may
 contain face embeddings and reference crops of real people — treat it as
 sensitive data and keep it on trusted hardware.
 
@@ -112,6 +113,37 @@ All keys optional; unknown keys are rejected (`additionalProperties: false`).
 | `transcriptDir` | `~/.openclaw/plugins/visual-memory/transcripts` | Per-run JSONL transcripts (active-memory parity logging). |
 | `transcriptMaxFiles` | `200` | Transcript rotation cap. |
 
+## Tool-side config (`$VM_HOME/config.json`)
+
+Thresholds, register paths, dreaming parameters, and the inference backend are
+**not** plugin config — they belong to the Visual Memory CLI and live in an
+optional `config.json` in the tool home (`$VM_HOME`, default: the directory
+holding `vm.py`). The plugin needs no knowledge of it; the CLI reads it on
+every call.
+
+Rules (identical semantics to the plugin config: absent file/field ⇒ built-in
+default, never an error; partial configs deep-merge):
+
+```json
+{
+  "paths":       { "register": "register.db", "references": "references", "…": "…" },
+  "thresholds":  { "person": 0.40, "animal": 0.85, "vehicle": 0.60, "building": 0.60, "object": 0.60 },
+  "dreaming":    { "window_days": 3, "candidates_max": 5, "miss_budget": 3 },
+  "engine":      { "backend": "local", "cloud": { "allow_faces": false } }
+}
+```
+
+**Backend choice:** `local` (InsightFace + CLIP, default, fully offline) is the
+only functional backend. `cloud` is an opt-in interface stub for operators who
+explicitly wire and accept a remote embedding provider; it fails closed without
+double confirmation (backend chosen **and** data-class consent), and face
+embeddings stay blocked unless `engine.cloud.allow_faces` is deliberately
+raised by the operator. Per the project's ADR-0001, sending biometric data of
+third parties off the machine is discouraged and always the operator's own
+responsibility — disclosure is theirs to make, the default never leaks.
+
+Full field reference: the tool repository README ("Config (`config.json`)").
+
 ## Observability
 
 Every decision is greppable, and PII-free (path hashes, no message content):
@@ -151,6 +183,9 @@ Tests need no GPU; they run against fixture media in a Node test runner
 
 Full (German) documentation with architecture rationale, thresholds, commit
 history, and release conditions: [`docs/DOKUMENTATION.md`](docs/DOKUMENTATION.md).
+Design decisions: ADR-0001 (local engine), ADR-0002 (reference crops),
+ADR-0003 (config + swappable engine backend for third-party use) in the tool
+repository.
 
 ## License
 
